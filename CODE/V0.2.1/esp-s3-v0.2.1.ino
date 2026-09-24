@@ -25,6 +25,11 @@
  * Nuevo en 0.2.1: pagina 1 de corriente en orden actual, mediana, maxima,
  * minima; la vista del sensor SDI-12 muestra fabricante, modelo, version,
  * serie y version SDI-12 (aI!) junto a los valores medidos.
+ * Arreglos 0.2.1: Sense-QC ya no arrastra los pulsos de la placa anterior
+ * (PASS falso en P1/P2); cambiar "Samples" ya no deja leer fuera de los
+ * arreglos; el SHT10 ausente ya no se lee como -40.1 C (el Weather-QC pasa al
+ * SHT30); la tabla muestra 4 filas; TX SDI-12 queda en reposo al salir del
+ * modulo (pines dedicados en el S3).
  * De 0.2.0: LED RGB de debug visual + menu "Zigbee" (work in progress).
  * Hereda de 0.1.x: front-end SDI-12 de hardware (bit-bang 2 pines), scroll de
  * todos los valores (aD0!..aD9!), medicion aC!/aM! seleccionable, corriente en
@@ -251,6 +256,7 @@ float sa_a0v        = 0.0f;
 float sa_a1v        = 0.0f;
 String sa_failReason = "";
 unsigned long sa_testStart = 0;
+bool  sa_pulseReset = false;     // reiniciar los pulsos vistos al empezar cada test
 const unsigned long SA_TEST_DURATION = 5000; // 5s de observacion pulsos
 
 // ============================================
@@ -416,6 +422,7 @@ void updateUART();
 void parseSoilData(String& line);
 void updateSA();
 void updateWX();
+bool sht10Valid(float t, float h);
 void updateDischarge();
 
 void updateSDI12();
@@ -524,6 +531,9 @@ void setup() {
   lastEncoded = (digitalRead(ENCODER_TRA) << 1) | digitalRead(ENCODER_TRB);
   attachInterrupt(digitalPinToInterrupt(ENCODER_TRA), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_TRB), encoderISR, CHANGE);
+
+  // SDI-12: TX en reposo (marca) desde el arranque
+  sdi12Begin();
 
   // Pantalla bienvenida
   u8g2.clearBuffer();
@@ -855,6 +865,7 @@ void handleConfirmButton() {
       // Iniciar nuevo test
       testerStateSA = SA_TESTING;
       sa_testStart  = millis();
+      sa_pulseReset = true;
       sa_passed     = false;
       sa_failReason = "";
     }
@@ -1067,11 +1078,17 @@ void restoreDefaults() {
 // ============================================
 void reallocArrays() {
   if (recordedCurrents) { delete[] recordedCurrents; delete[] recordedTimes; delete[] recordedMAh; }
+  MAX_SAMPLES_CONFIG = constrain(MAX_SAMPLES_CONFIG, 10, 2000);   // evita agotar la RAM
   MAX_SAMPLES = MAX_SAMPLES_CONFIG;
   recordedCurrents = new float[MAX_SAMPLES];
   recordedTimes    = new unsigned long[MAX_SAMPLES];
   recordedMAh      = new float[MAX_SAMPLES];
   for (int i = 0; i < MAX_SAMPLES; i++) { recordedCurrents[i] = 0; recordedTimes[i] = 0; recordedMAh[i] = 0; }
+  // Los arreglos nuevos estan vacios: reiniciar el conteo evita leer fuera de ellos
+  sampleCount       = 0;
+  isRecording       = false;
+  recordingComplete = false;
+  endingRecording   = false;
 }
 
 // ============================================
@@ -1251,7 +1268,9 @@ void updateSA() {
   static bool p1_high_seen = false, p1_low_seen = false;
   static bool p2_high_seen = false, p2_low_seen = false;
 
-  if (elapsed == 0) { p1_high_seen = p1_low_seen = p2_high_seen = p2_low_seen = false; }
+  // Antes se reiniciaba solo si elapsed == 0 exacto, y a veces se arrastraban
+  // los pulsos de la placa anterior (PASS falso en P1/P2)
+  if (sa_pulseReset) { p1_high_seen = p1_low_seen = p2_high_seen = p2_low_seen = false; sa_pulseReset = false; }
 
   if (pulse1) p1_high_seen = true; else p1_low_seen = true;
   if (pulse2) p2_high_seen = true; else p2_low_seen = true;
@@ -1284,6 +1303,12 @@ void updateSA() {
 // ============================================
 // WEATHER-QC UPDATE
 // ============================================
+// El SHT1x-ESP no devuelve NaN si el SHT10 no responde: convierte el NAN del
+// dato crudo en 0, o sea T = -40.1 C y H = -2.7 %. Se descarta lo fuera de rango.
+bool sht10Valid(float t, float h) {
+  return !isnan(t) && !isnan(h) && t > -39.0f && t < 124.0f && h > -1.0f && h < 105.0f;
+}
+
 void updateWX() {
   if (testerStateWX != WX_TESTING) return;
 
@@ -1297,7 +1322,7 @@ void updateWX() {
   wx_sht_temp = sht10.readTemperatureC();
   wx_sht_hum  = sht10.readHumidity();
 
-  bool sht10valid = !isnan(wx_sht_temp) && !isnan(wx_sht_hum);
+  bool sht10valid = sht10Valid(wx_sht_temp, wx_sht_hum);   // si no, se usa el SHT30
 
   if (!sht10valid) {
     wx_sht_temp = sht30.readTemperature();
@@ -1427,10 +1452,12 @@ void sdi12Begin() {
   sdi12Active = true;
 }
 
-// Libera los pines (vuelven a entrada) para su uso normal.
+// Sale del modulo. En el S3 los pines SDI-12 son dedicados: TX queda como
+// salida en reposo (marca) para no dejar flotando la entrada del front-end.
 void exitSDI12() {
   sdi12Active = false;
-  pinMode(SDI12_TX_PIN, INPUT);
+  pinMode(SDI12_TX_PIN, OUTPUT);
+  digitalWrite(SDI12_TX_PIN, SDI12_TX_MARK);
   pinMode(SDI12_RX_PIN, INPUT);
 }
 
@@ -2271,7 +2298,7 @@ void drawRawDataView() {
       sprintf(buf, "    P:%.0fhPa", bp); u8g2.drawStr(2, 35, buf);
 
       float s10t = sht10.readTemperatureC(), s10h = sht10.readHumidity();
-      if (!isnan(s10t)) { sprintf(buf, "SHT10 T:%.1fC H:%.0f%%", s10t, s10h); u8g2.drawStr(2, 43, buf); }
+      if (sht10Valid(s10t, s10h)) { sprintf(buf, "SHT10 T:%.1fC H:%.0f%%", s10t, s10h); u8g2.drawStr(2, 43, buf); }
       else u8g2.drawStr(2, 43, "SHT10: --");
 
       float s30t = sht30.readTemperature(), s30h = sht30.readHumidity();
@@ -2308,7 +2335,7 @@ void drawTempHumView() {
   u8g2.drawStr(2, 29, buf);
 
   // SHT10
-  if (!isnan(s10t) && !isnan(bt)) {
+  if (sht10Valid(s10t, s10h) && !isnan(bt)) {
     float dT = s10t - bt;
     sprintf(buf, "S10  %5.1fC %4.0f%% %+.1f", s10t, s10h, dT);
   } else { sprintf(buf, "SHT10: no detect."); }
@@ -2322,7 +2349,7 @@ void drawTempHumView() {
   u8g2.drawStr(2, 49, buf);
 
   // Estado
-  bool s10ok = !isnan(s10t) && fabs(s10t - bt) <= WX_TEMP_TOL && fabs(s10h - bh) <= WX_HUM_TOL;
+  bool s10ok = sht10Valid(s10t, s10h) && fabs(s10t - bt) <= WX_TEMP_TOL && fabs(s10h - bh) <= WX_HUM_TOL;
   bool s30ok = !isnan(s30t) && fabs(s30t - bt) <= WX_TEMP_TOL && fabs(s30h - bh) <= WX_HUM_TOL;
 
   u8g2.setFont(u8g2_font_4x6_tf);

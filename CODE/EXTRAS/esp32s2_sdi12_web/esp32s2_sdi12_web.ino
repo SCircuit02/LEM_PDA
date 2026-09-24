@@ -478,7 +478,7 @@ void setup() {
   if (STATUS_LED >= 0) pinMode(STATUS_LED, OUTPUT);
 
   WiFi.mode(WIFI_AP);
-  uint8_t mac[6];
+  uint8_t mac[6] = {0};
   WiFi.softAPmacAddress(mac);
   char ssid[16];
   snprintf(ssid, sizeof(ssid), "LemPDA-%02X%02X", mac[4], mac[5]);

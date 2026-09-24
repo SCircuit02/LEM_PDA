@@ -1,24 +1,55 @@
 /*
- * QC LemBot - ESP32-C3
- * Version: 0.1.5
- * Implementacion completa de todos los modulos
- * Historial reciente:
- *   0.1.2 - SDI-12 con front-end de hardware (2 pines, bit-bang):
- *           TX=GPIO7 -> SN74LVC1G3157 -> SN74LVC1G240 (inversor) -> bus
- *           RX=GPIO6 <- SN74AHC1G14 (inversor Schmitt) <- bus
- *           Las dos inversiones cancelan la del bus => UART normal 1200 7E1.
- *   0.1.3 - Vista de datos SDI-12 con scroll que muestra TODOS los valores
- *           (lee aD0!..aD9!); formato "- valor" por linea.
- *   0.1.4 - Medicion aC! por defecto; el click del encoder en la pantalla de
- *           datos re-pide con aM! (sensores que dan mas valores con aM!).
- *   0.1.5 - Pagina 1 de corriente en orden: actual, mediana, maxima, minima.
- *           SDI-12: la vista del sensor muestra fabricante, modelo, version,
- *           serie y version SDI-12 (aI!) junto a los valores medidos.
- *           Arreglos: Sense-QC ya no arrastra los pulsos de la placa anterior
- *           (PASS falso en P1/P2); cambiar "Samples" ya no deja leer fuera de
- *           los arreglos; el SHT10 ausente ya no se lee como -40.1 C (el
- *           Weather-QC pasa al SHT30); la tabla muestra 4 filas (la 5a chocaba
- *           con el pie).
+ * QC LemBot - ESP32-S3 LOLIN Mini (Wemos S3 Mini)
+ * Version: 0.2.2
+ * Port a ESP32-S3 (Xtensa LX7 dual, WiFi + BT 5 LE). Requiere el core
+ * arduino-esp32 v3.x ("LOLIN S3 Mini" o "ESP32S3 Dev Module" en el IDE).
+ *
+ * MCU objetivo: ESP32-S3 (LOLIN S3 Mini). Gemelo del port C6
+ * (tester_esp32c6_v0_2_0.ino), con el mapa de pines del S3.
+ *
+ * Mapa de pines S3 (LOLIN S3 Mini):
+ *   Siempre activos:
+ *     GP5=EncA GP6=EncB GP7=Back GP8=Confirm GP9=BtnEnc GP11=SDA GP12=SCL
+ *     GP13=SDI-12 TX  GP10=SDI-12 RX
+ *     GP1=ADC bateria (ADC1_CH0: no se deshabilita con WiFi/BT)
+ *   Modulos (0.2.2: UART y Soil escuchan siempre; SHT10/ADS/BME/SHT30 se
+ *   leen para la web solo con la pestana Sensores abierta):
+ *     GP2=Pulse1 GP4=Pulse2  GP16=SHT10 data GP17=SHT10 clk  GP18=UART RX
+ *   LED: GP47=RGB WS2812 onboard (debug visual)  [confirmar 47 vs 48]
+ *   Evitados: GP0/3/45/46 (strapping), GP19/20 (USB), GP26-32 (flash),
+ *             GP43/44 (UART0 debug), GP33-42/48.
+ *
+ * Bateria: ADC INTERNO en GP1 (ADC1_CH0), divisor 2:1, analogReadMilliVolts()
+ * (calibrado). ADC1 sigue disponible con WiFi/BT activos (ADC2 = GP11..GP20 no).
+ * El ADS1115 se conserva para A0/A1 (Sense-QC).
+ *
+ * Nuevo en 0.2.2: red WiFi propia con portal cautivo y GUI web. Todos los
+ * datos del equipo se ven y se manejan desde el telefono, sin pantalla,
+ * encoder ni botones:
+ *   Red:   LemPDA-XXXX  (XXXX = ultimos 4 digitos hex de la MAC)
+ *   Clave: 12345678     (WPA2 exige al menos 8 caracteres; ver AP_PASS)
+ *   Web:   http://192.168.4.1 (el telefono la abre solo al conectarse)
+ * Pestanas: Corriente (valores, grafico, CSV), Sensores (bateria, T/H, ADS,
+ * GPIO, Soil, UART), SDI-12 (escaneo, aI!, aC!, aM!, cambio de ID), Tests
+ * (Sense-QC, Weather-QC, descarga) y Equipo (configuracion y sistema).
+ * El monitor de corriente, los tests, el UART y el Soil corren en segundo
+ * plano aunque la pantalla muestre otro menu; se corre una prueba a la vez
+ * (pantalla o web) y el bus SDI-12 se turna entre la pantalla y la web.
+ * Sin INA228 la web sigue funcionando (error visible, datos disponibles y
+ * gestor SDI-12).
+ * La pagina va en index_html.h, en la misma carpeta que este .ino.
+ * Nuevo en 0.2.1: pagina 1 de corriente en orden actual, mediana, maxima,
+ * minima; la vista del sensor SDI-12 muestra fabricante, modelo, version,
+ * serie y version SDI-12 (aI!) junto a los valores medidos.
+ * Arreglos 0.2.1: Sense-QC ya no arrastra los pulsos de la placa anterior
+ * (PASS falso en P1/P2); cambiar "Samples" ya no deja leer fuera de los
+ * arreglos; el SHT10 ausente ya no se lee como -40.1 C (el Weather-QC pasa al
+ * SHT30); la tabla muestra 4 filas; TX SDI-12 queda en reposo al salir del
+ * modulo (pines dedicados en el S3).
+ * De 0.2.0: LED RGB de debug visual + menu "Zigbee" (work in progress).
+ * Hereda de 0.1.x: front-end SDI-12 de hardware (bit-bang 2 pines), scroll de
+ * todos los valores (aD0!..aD9!), medicion aC!/aM! seleccionable, corriente en
+ * 2 paginas, cambio de ID multi-sensor, bateria 0-100%.
  */
 
 #include <Arduino.h>
@@ -30,34 +61,48 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_SHT31.h>
 #include <SHT1x-ESP.h>  // Libreria: "SHT1x" by Practical Maker
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 
 // ============================================
-// PIN DEFINITIONS
+// PIN DEFINITIONS (ESP32-S3 LOLIN Mini)
 // ============================================
-#define ENCODER_TRA 0
-#define ENCODER_TRB 1
-#define BTN_BACK    2
-#define BTN_CONFIRM 3
-#define BTN_ENCODER 5
-#define SDA_PIN     8
-#define SCL_PIN     9
-#define PULSE1_PIN  6
-#define PULSE2_PIN  7
-#define UART_RX_PIN 20
+// UI e I2C en GPIOs libres del S3 (evitando strapping/USB/flash)
+#define ENCODER_TRA 5
+#define ENCODER_TRB 6
+#define BTN_BACK    7
+#define BTN_CONFIRM 8
+#define BTN_ENCODER 9
+#define SDA_PIN     11   // I2C (uso digital; que sea ADC2 no importa)
+#define SCL_PIN     12
+// Entradas de modulos (solo activas dentro de su modulo)
+#define PULSE1_PIN  2
+#define PULSE2_PIN  4
+#define UART_RX_PIN 18
 
-#define SHT10_DATA_PIN  7
-#define SHT10_CLOCK_PIN 10
+#define SHT10_DATA_PIN  16   // solo activo dentro de Weather-QC
+#define SHT10_CLOCK_PIN 17
+
+// ADC de bateria: ADC1_CH0 (GP1). ADC1 (GP1..GP10) NO se deshabilita al activar
+// WiFi/BT (ADC2 = GP11..GP20 SI). Divisor 2:1.
+#define BAT_ADC_PIN     1
+#define BAT_DIVIDER     2.0f
+
+// LED RGB WS2812 onboard (debug visual). Solo para el LED.
+// En la LOLIN S3 Mini suele ser GPIO47 (algunas variantes usan 48): confirmar.
+#define RGB_LED_PIN     47
 
 // ============================================
-// SDI-12 FRONT-END DE HARDWARE (2 pines)
+// SDI-12 FRONT-END DE HARDWARE (2 pines dedicados)
 // ============================================
-// TX = GPIO7 -> SN74LVC1G3157 -> SN74LVC1G240 (inversor) -> bus SDI-12
-// RX = GPIO6 <- SN74AHC1G14 (inversor Schmitt) <- bus SDI-12
+// TX = GP13 -> SN74LVC1G3157 -> SN74LVC1G240 (inversor) -> bus SDI-12
+// RX = GP10 <- SN74AHC1G14 (inversor Schmitt) <- bus SDI-12
 // El bus SDI-12 es logica invertida (marca/idle ~0V, espacio ~5V). Con una
 // inversion en TX y una en RX, ambas cancelan la del bus => el MCU ve un UART
 // estandar NO invertido: reposo/marca = ALTO, start/espacio = BAJO.
-#define SDI12_TX_PIN    7   // hacia el bus (compartido con PULSE2)
-#define SDI12_RX_PIN    6   // desde el bus (compartido con PULSE1 / SHT10 data)
+#define SDI12_TX_PIN    13
+#define SDI12_RX_PIN    10
 
 // Niveles GPIO (cambiar a la inversa solo si el banco lo exige)
 #define SDI12_TX_MARK   HIGH   // reposo / bit 1 / stop
@@ -142,6 +187,7 @@ enum MenuState {
   MENU_TEMP_HUM,
   MENU_UART,
   MENU_SDI12,
+  MENU_ZIGBEE,
   MENU_BATTERY_DISCHARGE,
   MENU_CONFIG,
   MENU_PINOUT
@@ -149,7 +195,7 @@ enum MenuState {
 
 MenuState currentState   = MENU_MAIN;
 int menuSelection        = 0;
-const int menuItems      = 11;
+const int menuItems      = 12;
 const int MENU_VISIBLE   = 4;
 int menuTopIndex         = 0;
 
@@ -363,6 +409,69 @@ const int CONFIG_VISIBLE = 5;
 int pinoutPage = 0;
 
 // ============================================
+// PORTAL WEB (0.2.2)
+// ============================================
+#define AP_PASS          "12345678"   // clave de la red (WPA2: minimo 8 caracteres)
+#define WEB_MAX_SENSORS  16           // sensores SDI-12 que guarda la web
+#define WEB_MAX_WAIT_S   30           // tope de espera de una medicion SDI-12 [s]
+const IPAddress AP_IP(192, 168, 4, 1);
+const IPAddress AP_MASK(255, 255, 255, 0);
+WebServer webServer(80);
+DNSServer webDns;
+String    apName = "";
+
+// Sensores I2C detectados al arrancar (la web y los tests no leen los ausentes:
+// el ADS1115 ausente dejaria colgada su lectura)
+bool inaFailed    = false;
+bool adsPresent   = false;
+bool bmePresent   = false;
+bool sht30Present = false;
+
+// Lecturas de sensores para la web: solo con la pestana Sensores abierta
+const unsigned long WEB_ACTIVE_MS = 4000UL;
+unsigned long webSenHit = 0, webTAds = 0, webTEnv = 0, webTS10 = 0, envAt = 0;
+float envBmeT = NAN, envBmeH = NAN, envBmeP = NAN;
+float envS30T = NAN, envS30H = NAN, envS10T = NAN, envS10H = NAN;
+float adsV[4] = {NAN, NAN, NAN, NAN};
+bool  gpioP1 = false, gpioP2 = false, gpioUrx = false;
+
+// Tareas SDI-12 de la web (por pasos, la web sigue respondiendo mientras un
+// sensor mide). Los tipos van antes de la primera funcion: el IDE inserta ahi
+// los prototipos automaticos y necesitan conocerlos.
+struct WMeas {
+  int n = -1;            // -1 = sin medir, -2 = el sensor no soporta el comando
+  int t = 0;             // segundos de espera que pidio el sensor
+  uint32_t at = 0;       // segundo de uptime en que se midio
+  String raw;            // valores concatenados: "+1.23-4.5+6"
+};
+struct WSensor {
+  char   addr = 0;
+  String info;           // respuesta de aI! sin la direccion
+  WMeas  c, m;           // resultados de aC! y aM!
+};
+enum WJobType : uint8_t { WJOB_NONE, WJOB_SCAN, WJOB_INFO, WJOB_MEASURE, WJOB_CHID };
+struct WJob {
+  WJobType type = WJOB_NONE;
+  uint8_t phase = 0;
+  int  i = 0;            // escaneo: direccion en curso
+  int  k = 0;            // escaneo: sensor en curso / medicion: indice de aD
+  char target = 0;       // sensor sobre el que se trabaja
+  char mode = 'C';       // 'C' o 'M'
+  bool both = false;     // medir aC! y despues aM!
+  char newAddr = 0;
+  int  n = -1, t = 0;
+  unsigned long waitStart = 0, waitMs = 0;
+  String raw;
+};
+WSensor wSensors[WEB_MAX_SENSORS];
+int     wNSensors = 0;
+WJob    wJob;
+char    wScanFound[SDI12_NUM_ADDR];
+int     wScanCount = 0;
+String  wLastMsg = "";
+bool    wLastErr = false;
+
+// ============================================
 // FORWARD DECLARATIONS
 // ============================================
 void encoderISR();   // IRAM_ATTR va solo en la definicion
@@ -433,9 +542,20 @@ void drawBatteryDischarge();
 void drawConfigView();
 void drawPinoutView();
 void drawSDI12View();
+void drawZigbeeView();
 void sdi12ShowBusy(const char* msg);
+void rgbSet(uint8_t r, uint8_t g, uint8_t b);
+void updateStatusLED();
 void drawBatteryIcon(int x, int y, int percent);
 void drawScrollBar(int x, int y, int h, int cur, int total);
+
+// Portal web (0.2.2)
+void webSetup();
+void webLoop();
+void wJobStep();
+bool sdi12OledBusy();
+bool anyTestRunning();
+void updateSerialInputs();
 
 // ============================================
 // ISR ENCODER
@@ -464,25 +584,45 @@ void setup() {
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tf);
 
-  // INA228 - obligatorio
+  // ADS1115, BME280 y SHT30: se anota cuales respondieron
+  adsPresent = ads.begin();
+  if (!adsPresent) Serial.println("ADS1115 no encontrado");
+  ads.setGain(GAIN_ONE);
+  bmePresent = bme.begin(0x76);
+  if (!bmePresent) Serial.println("BME280 no encontrado");
+  sht30Present = sht30.begin(0x44);
+  if (!sht30Present) Serial.println("SHT30 no encontrado");
+
+  // INA228 - obligatorio para medir. Sin el, el equipo queda en modo web:
+  // la pagina muestra el error, los datos disponibles y el gestor SDI-12.
   if (!ina228.begin()) {
+    inaFailed = true;
+    rgbSet(60, 0, 0);            // rojo fijo = error critico de hardware
+    analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+    pinMode(PULSE1_PIN,  INPUT);
+    pinMode(PULSE2_PIN,  INPUT);
+    pinMode(UART_RX_PIN, INPUT);
+    reallocArrays();
+    sdi12Begin();
+    webSetup();
     u8g2.clearBuffer();
-    u8g2.drawStr(10, 30, "INA228 ERROR!");
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(10, 16, "INA228 ERROR!");
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(4, 34, "Web y SDI-12 activos:");
+    u8g2.drawStr(4, 46, apName.c_str());
+    u8g2.drawStr(4, 58, "http://192.168.4.1");
     u8g2.sendBuffer();
-    while (1) delay(100);
+    unsigned long lastBat = 0;
+    while (1) {
+      if (millis() - lastBat > 2000) { updateBattery(); lastBat = millis(); }
+      updateSerialInputs();
+      webLoop();
+      delay(2);
+    }
   }
   ina228.setShunt(0.015, 20.0);
   ina228.setAveragingCount(INA228_COUNT_128);
-
-  // ADS1115
-  if (!ads.begin()) Serial.println("ADS1115 no encontrado");
-  ads.setGain(GAIN_ONE);
-
-  // BME280
-  if (!bme.begin(0x76)) Serial.println("BME280 no encontrado");
-
-  // SHT30
-  if (!sht30.begin(0x44)) Serial.println("SHT30 no encontrado");
 
   // Pines
   pinMode(ENCODER_TRA,  INPUT_PULLUP);
@@ -494,18 +634,32 @@ void setup() {
   pinMode(PULSE2_PIN,   INPUT);
   pinMode(UART_RX_PIN,  INPUT);
 
+  // ADC de bateria (GP1, ADC1): rango completo para leer el divisor
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+
   lastEncoded = (digitalRead(ENCODER_TRA) << 1) | digitalRead(ENCODER_TRB);
   attachInterrupt(digitalPinToInterrupt(ENCODER_TRA), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_TRB), encoderISR, CHANGE);
 
-  // Pantalla bienvenida
+  // SDI-12: TX en reposo (marca) desde el arranque
+  sdi12Begin();
+
+  // Red WiFi LemPDA-XXXX + portal web
+  webSetup();
+
+  // Pantalla bienvenida (con la red para conectarse)
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB10_tr);
-  u8g2.drawStr(20, 28, "QC LemBot");
+  u8g2.drawStr(20, 24, "QC LemBot");
   u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(38, 46, "v0.1.5");
+  u8g2.drawStr(14, 40, "v0.2.2 ESP32-S3");
+  u8g2.setFont(u8g2_font_5x7_tf);
+  String net = apName + " 192.168.4.1";
+  u8g2.drawStr((128 - u8g2.getStrWidth(net.c_str())) / 2, 58, net.c_str());
   u8g2.sendBuffer();
+  rgbSet(0, 0, 25);              // azul = arrancando
   delay(2000);
+  rgbSet(0, 0, 0);
 
   reallocArrays();
 }
@@ -524,39 +678,26 @@ void loop() {
     lastBatUpdate = millis();
   }
 
-  // Corriente (estados que la necesitan)
-  if (currentState == MENU_CURRENT_VIEW ||
-      currentState == MENU_GRAPH_VIEW   ||
-      currentState == MENU_TABLE_VIEW   ||
-      currentState == MENU_RAW_DATA) {
+  // Corriente: siempre, aunque la pantalla muestre otro menu (la web la
+  // muestra). En pausa durante la descarga de bateria, que usa el acumulador
+  // de carga del INA228.
+  if (dischState != DISCH_RUNNING) {
     updateCurrentReadings();
     handleRecording();
   }
 
-  // Modulos activos
-  if (currentState == MENU_TESTER_SA)          updateSA();
-  if (currentState == MENU_TESTER_WEATHER)     updateWX();
-  if (currentState == MENU_TESTER_SOIL)        { /* se procesa en loop serial */ }
-  if (currentState == MENU_BATTERY_DISCHARGE)  updateDischarge();
-  if (currentState == MENU_UART)               updateUART();
-  if (currentState == MENU_SDI12)              updateSDI12();
+  // Tests, descarga, UART y Soil: siempre (cada uno no hace nada si no esta
+  // activo), asi funcionan igual desde la pantalla o desde la web
+  updateSA();
+  updateWX();
+  updateDischarge();
+  updateSerialInputs();
+  if (currentState == MENU_SDI12) updateSDI12();
 
-  // UART monitor - leer siempre si estamos en ese menu
-  if (currentState == MENU_UART) updateUART();
+  // Red WiFi, portal web y tareas SDI-12 pedidas desde la web
+  webLoop();
 
-  // Soil - leer serial siempre si estamos en ese menu
-  if (currentState == MENU_TESTER_SOIL) {
-    while (Serial.available()) {
-      char c = (char)Serial.read();
-      if (c == '\n') {
-        parseSoilData(soilBuffer);
-        soilBuffer = "";
-      } else {
-        soilBuffer += c;
-      }
-    }
-  }
-
+  updateStatusLED();
   updateDisplay();
   delay(10);
 }
@@ -605,8 +746,8 @@ void handleEncoder() {
   }
   else if (currentState == MENU_PINOUT) {
     pinoutPage += diff;
-    if (pinoutPage < 0) pinoutPage = 1;
-    if (pinoutPage > 1) pinoutPage = 0;
+    while (pinoutPage < 0) pinoutPage += 3;
+    while (pinoutPage > 2) pinoutPage -= 3;
   }
   else if (currentState == MENU_SDI12 && sdi12State == SDI12_LIST) {
     int total = sdi12Count + 1; // +1 = opcion "Cambiar ID"
@@ -684,16 +825,17 @@ void handleEncoderButton() {
   } else {
     // Desde cualquier pantalla: volver al menu principal
     if (currentState == MENU_SDI12) exitSDI12();
+    // Resetear solo el tester de la pantalla que se deja: los iniciados
+    // desde la web siguen corriendo en segundo plano
+    if (currentState == MENU_TESTER_SA)         testerStateSA = SA_IDLE;
+    if (currentState == MENU_TESTER_WEATHER)    testerStateWX = WX_IDLE;
+    if (currentState == MENU_BATTERY_DISCHARGE) dischState    = DISCH_IDLE;
     currentState     = MENU_MAIN;
     menuSelection    = 0;
     menuTopIndex     = 0;
     isEditingConfig  = false;
     configSelection  = 0;
     configTopIndex   = 0;
-    // Resetear estados de testers
-    testerStateSA = SA_IDLE;
-    testerStateWX = WX_IDLE;
-    dischState    = DISCH_IDLE;
   }
 }
 
@@ -805,7 +947,7 @@ void handleConfirmButton() {
     rawDataPage = (rawDataPage + 1) % RAW_PAGES;
   }
   else if (currentState == MENU_PINOUT) {
-    pinoutPage = 1 - pinoutPage;
+    pinoutPage = (pinoutPage + 1) % 3;
   }
   else if (currentState == MENU_CONFIG && !isEditingConfig) {
     if (configSelection == configItems - 1) {
@@ -821,7 +963,7 @@ void handleConfirmButton() {
     isEditingConfig = false;
   }
   else if (currentState == MENU_TESTER_SA) {
-    if (testerStateSA == SA_IDLE || testerStateSA == SA_RESULT) {
+    if ((testerStateSA == SA_IDLE || testerStateSA == SA_RESULT) && !anyTestRunning()) {
       // Iniciar nuevo test
       testerStateSA = SA_TESTING;
       sa_testStart  = millis();
@@ -831,7 +973,7 @@ void handleConfirmButton() {
     }
   }
   else if (currentState == MENU_TESTER_WEATHER) {
-    if (testerStateWX == WX_IDLE || testerStateWX == WX_RESULT) {
+    if ((testerStateWX == WX_IDLE || testerStateWX == WX_RESULT) && !anyTestRunning()) {
       testerStateWX = WX_TESTING;
       sa_testStart  = millis();
       wx_passed     = false;
@@ -839,7 +981,7 @@ void handleConfirmButton() {
     }
   }
   else if (currentState == MENU_BATTERY_DISCHARGE) {
-    if (dischState == DISCH_IDLE) {
+    if (dischState == DISCH_IDLE && !anyTestRunning()) {
       dischState       = DISCH_RUNNING;
       disch_startTime  = millis();
       disch_lastSample = millis();
@@ -903,17 +1045,18 @@ void handleConfirmButton() {
 void selectMenuItem() {
   switch (menuSelection) {
     case 0: currentState = MENU_CURRENT_VIEW;         resetRecording(); break;
-    case 1: currentState = MENU_TESTER_SA;            testerStateSA = SA_IDLE; break;
-    case 2: currentState = MENU_TESTER_WEATHER;       testerStateWX = WX_IDLE; break;
+    case 1: currentState = MENU_TESTER_SA;            if (testerStateSA != SA_TESTING) testerStateSA = SA_IDLE; break;
+    case 2: currentState = MENU_TESTER_WEATHER;       if (testerStateWX != WX_TESTING) testerStateWX = WX_IDLE; break;
     case 3: currentState = MENU_TESTER_SOIL;          soilBuffer = ""; break;
     case 4: currentState = MENU_RAW_DATA;             rawDataPage = 0; break;
     case 5: currentState = MENU_TEMP_HUM;             break;
     case 6: currentState = MENU_UART;                 break;
     case 7: currentState = MENU_SDI12;                sdi12State = SDI12_IDLE;
             sdi12Begin(); break;
-    case 8: currentState = MENU_BATTERY_DISCHARGE;    dischState = DISCH_IDLE; break;
-    case 9: currentState = MENU_CONFIG;               configSelection = 0; configTopIndex = 0; break;
-    case 10: currentState = MENU_PINOUT;              pinoutPage = 0; break;
+    case 8: currentState = MENU_ZIGBEE;               break;
+    case 9: currentState = MENU_BATTERY_DISCHARGE;    if (dischState != DISCH_RUNNING) dischState = DISCH_IDLE; break;
+    case 10: currentState = MENU_CONFIG;              configSelection = 0; configTopIndex = 0; break;
+    case 11: currentState = MENU_PINOUT;              pinoutPage = 0; break;
   }
 }
 
@@ -1167,7 +1310,8 @@ void resetRecording() {
   estMAh            = 0;
   estStartTime      = millis();
   estLastTime       = 0;
-  ina228.resetAccumulators();
+  // La descarga de bateria usa el acumulador de carga: no borrarlo
+  if (dischState != DISCH_RUNNING) ina228.resetAccumulators();
 }
 
 // ============================================
@@ -1191,8 +1335,10 @@ int batPercentFromV(float v) {
 }
 
 void updateBattery() {
-  int16_t adc3  = ads.readADC_SingleEnded(3);
-  batteryVoltage = (adc3 * 0.000125f) * 2.0f;
+  // ADC interno del S3 en GP1 (ADC1_CH0), calibrado de fabrica. ADC1 sigue
+  // disponible con WiFi/BT activos. Divisor 2:1.
+  uint32_t mv = analogReadMilliVolts(BAT_ADC_PIN);
+  batteryVoltage = (mv / 1000.0f) * BAT_DIVIDER;
 
   batteryPercent = batPercentFromV(batteryVoltage);
 
@@ -1215,8 +1361,8 @@ void updateSA() {
 
   // Leer valores actuales
   sa_current = ina228.getCurrent_mA();
-  sa_a0v     = ads.readADC_SingleEnded(0) * 0.000125f;
-  sa_a1v     = ads.readADC_SingleEnded(1) * 0.000125f;
+  sa_a0v     = adsPresent ? ads.readADC_SingleEnded(0) * 0.000125f : 0.0f;
+  sa_a1v     = adsPresent ? ads.readADC_SingleEnded(1) * 0.000125f : 0.0f;
 
   bool pulse1 = digitalRead(PULSE1_PIN);
   bool pulse2 = digitalRead(PULSE2_PIN);
@@ -1381,6 +1527,20 @@ void updateUART() {
   }
 }
 
+// UART monitor (GP18) y sonda DFM (Serial): se leen siempre para la web
+void updateSerialInputs() {
+  updateUART();
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      parseSoilData(soilBuffer);
+      soilBuffer = "";
+    } else if (soilBuffer.length() < 512) {    // tope por si llega basura sin fin de linea
+      soilBuffer += c;
+    }
+  }
+}
+
 // ============================================
 // SDI-12 VIEWER / EDITOR
 // ============================================
@@ -1409,10 +1569,12 @@ void sdi12Begin() {
   sdi12Active = true;
 }
 
-// Libera los pines (vuelven a entrada) para su uso normal (PULSE1/PULSE2/SHT10).
+// Sale del modulo. En el S3 los pines SDI-12 son dedicados: TX queda como
+// salida en reposo (marca) para no dejar flotando la entrada del front-end.
 void exitSDI12() {
   sdi12Active = false;
-  pinMode(SDI12_TX_PIN, INPUT);
+  pinMode(SDI12_TX_PIN, OUTPUT);
+  digitalWrite(SDI12_TX_PIN, SDI12_TX_MARK);
   pinMode(SDI12_RX_PIN, INPUT);
 }
 
@@ -1582,7 +1744,9 @@ void sdi12DoMeasure(char addr, bool concurrent) {
   // Esperar a que el sensor complete la medicion (tiempo indicado, acotado)
   unsigned long limit = (unsigned long)waitSec * 1000UL;
   if (limit > 9000UL) limit = 9000UL;
-  delay(limit + 150);
+  // Mientras espera, la web sigue respondiendo (sus tareas SDI-12 esperan)
+  unsigned long tw = millis();
+  while (millis() - tw < limit + 150) { webServer.handleClient(); delay(2); }
 
   // Leer aD0!..aD9! acumulando hasta que no haya mas datos (sin cortar por cantidad)
   for (int d = 0; d <= 9; d++) {
@@ -1682,6 +1846,7 @@ void sdi12DoChangeId(char oldAddr, char newAddr) {
 
 // Maquina de estados del modulo SDI-12 (llamada desde loop)
 void updateSDI12() {
+  if (wJob.type != WJOB_NONE) return;   // la web esta usando el bus: esperar su turno
   switch (sdi12State) {
     case SDI12_SCANNING:
       sdi12DoScanStep();
@@ -1732,6 +1897,61 @@ void updateDischarge() {
 }
 
 // ============================================
+// LED RGB (WS2812 onboard) - DEBUG VISUAL
+// ============================================
+// Colores tenues para no encandilar. Solo se reescribe si cambia.
+void rgbSet(uint8_t r, uint8_t g, uint8_t b) {
+  rgbLedWrite(RGB_LED_PIN, r, g, b);   // API del core arduino-esp32 v3.x
+}
+
+void updateStatusLED() {
+  static unsigned long lastBlink = 0;
+  static bool blinkOn = false;
+  if (millis() - lastBlink > 400) { blinkOn = !blinkOn; lastBlink = millis(); }
+
+  uint8_t r = 0, g = 0, b = 0;   // por defecto apagado (menu principal, etc.)
+
+  switch (currentState) {
+    case MENU_CURRENT_VIEW:
+    case MENU_GRAPH_VIEW:
+    case MENU_TABLE_VIEW:
+      if (currentCurrent > OC_THRESHOLD)      { r = 60; }                 // OC: rojo fuerte
+      else if (isRecording)                   { r = blinkOn ? 25 : 0; }   // REC: rojo parpadeo
+      else if (recordingComplete)             { g = 10; }                 // done: verde tenue
+      break;
+    case MENU_TESTER_SA:
+      if      (testerStateSA == SA_TESTING)   { b = 30; }
+      else if (testerStateSA == SA_RESULT)    { if (sa_passed) g = 30; else r = 30; }
+      break;
+    case MENU_TESTER_WEATHER:
+      if      (testerStateWX == WX_TESTING)   { b = 30; }
+      else if (testerStateWX == WX_RESULT)    { if (wx_passed) g = 30; else r = 30; }
+      break;
+    case MENU_SDI12:
+      switch (sdi12State) {
+        case SDI12_SCANNING:  b = blinkOn ? 30 : 5; break;                // escaneando
+        case SDI12_SENSOR:    if (sdi12NumValues > 0) g = 12; else r = 12; break;
+        case SDI12_CHGRESULT: if (sdi12ChgOk) g = 30; else r = 30; break;
+        default:              b = 6; break;                               // modulo activo
+      }
+      break;
+    case MENU_BATTERY_DISCHARGE:
+      if      (dischState == DISCH_RUNNING)   { r = 20; g = 12; }         // ambar
+      else if (dischState == DISCH_DONE)      { g = 20; }
+      break;
+    case MENU_ZIGBEE:
+      r = 12; b = 12;                                                     // morado = WIP
+      break;
+    default:
+      break;
+  }
+
+  // Evitar reescribir el WS2812 en cada pasada del loop
+  static uint8_t lr = 255, lg = 255, lb = 255;
+  if (r != lr || g != lg || b != lb) { rgbSet(r, g, b); lr = r; lg = g; lb = b; }
+}
+
+// ============================================
 // DISPLAY
 // ============================================
 void updateDisplay() {
@@ -1748,6 +1968,7 @@ void updateDisplay() {
     case MENU_TEMP_HUM:          drawTempHumView();      break;
     case MENU_UART:              drawUARTView();         break;
     case MENU_SDI12:             drawSDI12View();        break;
+    case MENU_ZIGBEE:            drawZigbeeView();       break;
     case MENU_BATTERY_DISCHARGE: drawBatteryDischarge(); break;
     case MENU_CONFIG:            drawConfigView();       break;
     case MENU_PINOUT:            drawPinoutView();       break;
@@ -1792,9 +2013,10 @@ void drawMainMenu() {
     "6: Temp & Hum",
     "7: UART Monitor",
     "8: SDI-12",
-    "9: Descarga Bat",
-    "10: Config",
-    "11: Pinout"
+    "9: Zigbee",
+    "10: Descarga Bat",
+    "11: Config",
+    "12: Pinout"
   };
 
   u8g2.setFont(u8g2_font_7x13_tf);
@@ -1873,7 +2095,9 @@ void drawCurrentView() {
   u8g2.drawStr(2, 63, currentViewPage == 0 ? "OK>pag2 BK>menu" : "OK>graf BK>pag1");
 
   char sb[12];
-  if (currentCurrent > OC_THRESHOLD) {
+  if (dischState == DISCH_RUNNING) {
+    u8g2.drawStr(104, 63, "PAUSA");        // descarga de bateria en curso
+  } else if (currentCurrent > OC_THRESHOLD) {
     u8g2.drawStr(102, 63, "!!OC");
   } else if (isRecording) {
     if (endingRecording) {
@@ -1993,7 +2217,7 @@ void drawSenseQC() {
   if (testerStateSA == SA_IDLE) {
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.drawStr(5, 28, "Conectar placa hija");
-    u8g2.drawStr(5, 42, "y presionar OK");
+    u8g2.drawStr(5, 42, anyTestRunning() ? "Otra prueba en curso" : "y presionar OK");
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 63, "OK:Iniciar  Enc:Menu");
     return;
@@ -2052,7 +2276,7 @@ void drawWeatherQC() {
   if (testerStateWX == WX_IDLE) {
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.drawStr(5, 28, "Conectar placa hija");
-    u8g2.drawStr(5, 42, "y presionar OK");
+    u8g2.drawStr(5, 42, anyTestRunning() ? "Otra prueba en curso" : "y presionar OK");
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 63, "OK:Iniciar  Enc:Menu");
     return;
@@ -2169,7 +2393,8 @@ void drawRawDataView() {
     }
     case 1: {
       u8g2.drawStr(28, 18, "ADS1115");
-      for (int ch = 0; ch < 4; ch++) {
+      if (!adsPresent) u8g2.drawStr(2, 36, "No detectado");
+      else for (int ch = 0; ch < 4; ch++) {
         float v = ads.readADC_SingleEnded(ch) * 0.000125f;
         sprintf(buf, "A%d: %.4f V", ch, v);
         u8g2.drawStr(2, 27 + ch * 9, buf);
@@ -2182,9 +2407,9 @@ void drawRawDataView() {
       u8g2.drawStr(38, 18, "GPIO");
       bool p1 = digitalRead(PULSE1_PIN);
       bool p2 = digitalRead(PULSE2_PIN);
-      sprintf(buf, "GPIO6 (Pulse1): %s", p1?"HIGH":"LOW"); u8g2.drawStr(2, 27, buf);
-      sprintf(buf, "GPIO7 (Pulse2): %s", p2?"HIGH":"LOW"); u8g2.drawStr(2, 36, buf);
-      sprintf(buf, "UART_RX(20):    %s", digitalRead(UART_RX_PIN)?"HIGH":"LOW"); u8g2.drawStr(2, 45, buf);
+      sprintf(buf, "GP2 (Pulse1): %s", p1?"HIGH":"LOW"); u8g2.drawStr(2, 27, buf);
+      sprintf(buf, "GP4 (Pulse2): %s", p2?"HIGH":"LOW"); u8g2.drawStr(2, 36, buf);
+      sprintf(buf, "UART_RX(18):  %s", digitalRead(UART_RX_PIN)?"HIGH":"LOW"); u8g2.drawStr(2, 45, buf);
       sprintf(buf, "Bat:%.2fV  I:%.1fmA", batteryVoltage, currentCurrent); u8g2.drawStr(2, 54, buf);
       break;
     }
@@ -2273,8 +2498,26 @@ void drawUARTView() {
   u8g2.drawStr(80, 63, "Enc:Menu");
 }
 
+// -------- ZIGBEE (work in progress) --------
+void drawZigbeeView() {
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(40, 8, "ZIGBEE");
+  u8g2.drawLine(0, 10, 128, 10);
+
+  u8g2.setFont(u8g2_font_7x13_tf);
+  u8g2.drawStr(10, 32, "Work in");
+  u8g2.drawStr(10, 46, "progress...");
+
+  u8g2.setFont(u8g2_font_4x6_tf);
+  u8g2.drawStr(70, 30, "S3 sin radio");
+  u8g2.drawStr(70, 38, "802.15.4:");
+  u8g2.drawStr(70, 46, "modulo externo");
+  u8g2.drawStr(0, 63, "BACK/Enc:Menu");
+}
+
 // -------- SDI-12 (pantalla "ocupado" durante operaciones bloqueantes) --------
 void sdi12ShowBusy(const char* msg) {
+  rgbSet(0, 0, 30);   // azul = bus SDI-12 ocupado (operacion bloqueante)
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
   u8g2.drawStr(40, 10, "SDI-12");
@@ -2292,11 +2535,23 @@ void drawSDI12View() {
   u8g2.drawStr(40, 8, "SDI-12");
   u8g2.drawLine(0, 10, 128, 10);
 
+  // -------- La web esta usando el bus: la operacion de la pantalla espera --------
+  if (wJob.type != WJOB_NONE &&
+      (sdi12State == SDI12_SCANNING || sdi12State == SDI12_CHANGING ||
+       (sdi12State == SDI12_SENSOR && sdi12NeedMeasure))) {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(10, 30, "Bus SDI-12 ocupado");
+    u8g2.drawStr(10, 44, "por la web...");
+    u8g2.setFont(u8g2_font_4x6_tf);
+    u8g2.drawStr(0, 63, "BACK:Atras  Enc:Menu");
+    return;
+  }
+
   // -------- Pantalla inicial --------
   if (sdi12State == SDI12_IDLE) {
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.drawStr(5, 26, "Visor / Editor SDI-12");
-    u8g2.drawStr(5, 40, "Bus: TX=GP7 RX=GP6");
+    u8g2.drawStr(5, 40, "Bus: TX=GP13 RX=GP10");
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 63, "OK:Escanear  Enc:Menu");
     return;
@@ -2439,7 +2694,7 @@ void drawBatteryDischarge() {
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.drawStr(5, 28, "Conectar bateria");
     u8g2.drawStr(5, 40, "y resistencia");
-    u8g2.drawStr(5, 52, "Presionar OK");
+    u8g2.drawStr(5, 52, anyTestRunning() ? "Otra prueba en curso" : "Presionar OK");
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 63, "OK:Iniciar  Enc:Menu");
     return;
@@ -2545,30 +2800,640 @@ void drawConfigView() {
   }
 }
 
-// -------- PINOUT --------
+// -------- PINOUT (ESP32-S3 LOLIN Mini, 3 paginas) --------
 void drawPinoutView() {
-  if (pinoutPage == 0) {
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(20, 10, "Pinout v1.0");
-    u8g2.drawLine(0, 12, 128, 12);
-    u8g2.setFont(u8g2_font_5x7_tf);
-    u8g2.drawStr(2, 22, "GP0  - Encoder A");
-    u8g2.drawStr(2, 31, "GP1  - Encoder B");
-    u8g2.drawStr(2, 40, "GP2  - BTN Back");
-    u8g2.drawStr(2, 49, "GP3  - BTN Confirm");
-    u8g2.drawStr(2, 58, "GP5  - BTN Encoder");
-  } else {
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(20, 10, "Pinout v1.0");
-    u8g2.drawLine(0, 12, 128, 12);
-    u8g2.setFont(u8g2_font_5x7_tf);
-    u8g2.drawStr(2, 22, "GP6 Pulse1/SHT10/SDIrx");
-    u8g2.drawStr(2, 31, "GP7 Pulse2/SDI-12 tx");
-    u8g2.drawStr(2, 40, "GP8  - SDA I2C");
-    u8g2.drawStr(2, 49, "GP9  - SCL I2C");
-    u8g2.drawStr(2, 58, "GP10-SHT10clk GP20-UART");
+  char buf[28];
+  u8g2.setFont(u8g2_font_6x10_tf);
+  snprintf(buf, sizeof(buf), "Pinout S3 [%d/3]", pinoutPage + 1);
+  u8g2.drawStr(15, 10, buf);
+  u8g2.drawLine(0, 12, 128, 12);
+  u8g2.setFont(u8g2_font_5x7_tf);
+
+  if (pinoutPage == 0) {          // UI
+    u8g2.drawStr(2, 22, "GP5  - Encoder A");
+    u8g2.drawStr(2, 31, "GP6  - Encoder B");
+    u8g2.drawStr(2, 40, "GP7  - BTN Back");
+    u8g2.drawStr(2, 49, "GP8  - BTN Confirm");
+    u8g2.drawStr(2, 58, "GP9  - BTN Encoder");
+  } else if (pinoutPage == 1) {   // Comunicaciones + bateria
+    u8g2.drawStr(2, 22, "GP11 - SDA I2C");
+    u8g2.drawStr(2, 31, "GP12 - SCL I2C");
+    u8g2.drawStr(2, 40, "GP13 - SDI-12 TX");
+    u8g2.drawStr(2, 49, "GP10 - SDI-12 RX");
+    u8g2.drawStr(2, 58, "GP1  - Bateria ADC1");
+  } else {                        // Testers y LED
+    u8g2.drawStr(2, 22, "GP2  - Pulse1");
+    u8g2.drawStr(2, 31, "GP4  - Pulse2");
+    u8g2.drawStr(2, 40, "GP16 - SHT10 Data");
+    u8g2.drawStr(2, 49, "GP17 - SHT10 Clk");
+    u8g2.drawStr(2, 58, "GP18 UART  GP47 RGB");
   }
 
   u8g2.setFont(u8g2_font_4x6_tf);
   u8g2.drawStr(25, 63, "OK/Gira:Cambiar  Enc:Menu");
+}
+
+// =====================================================================
+//  PORTAL WEB (0.2.2): red propia LemPDA-XXXX, portal cautivo y API JSON
+//  La web muestra todos los datos del equipo sin usar pantalla, encoder ni
+//  botones. El equipo sigue funcionando igual con su pantalla.
+// =====================================================================
+#include "index_html.h"      // pagina web (PAGE)
+
+// ---------- SDI-12: lectura de una linea (aviso de fin de aM!) ----------
+String sdi12ReadLine(uint16_t waitMs) {
+  String resp = "";
+  unsigned long t0 = millis();
+  while (millis() - t0 < waitMs) {
+    int ch = sdi12ReadChar(waitMs - (millis() - t0));
+    if (ch < 0 || ch == '\n') break;
+    if (ch == '\r') continue;
+    if (ch >= ' ' && ch < 127) resp += (char)ch;
+    if (resp.length() >= 80) break;
+  }
+  resp.trim();
+  return resp;
+}
+
+// La pantalla del equipo esta usando el bus SDI-12
+bool sdi12OledBusy() {
+  return currentState == MENU_SDI12 &&
+         (sdi12State == SDI12_SCANNING || sdi12State == SDI12_CHANGING ||
+          (sdi12State == SDI12_SENSOR && sdi12NeedMeasure));
+}
+
+// ---------- tareas SDI-12 de la web (por pasos, igual que el gestor S2) ----------
+int wFindSensor(char a) {
+  for (int i = 0; i < wNSensors; i++) if (wSensors[i].addr == a) return i;
+  return -1;
+}
+
+void wFinishJob(const String& msg, bool err) {
+  wLastMsg = msg;
+  wLastErr = err;
+  wJob.type = WJOB_NONE;
+  wJob.target = 0;
+}
+
+void wRebuildList() {
+  WSensor old[WEB_MAX_SENSORS];
+  int nOld = wNSensors;
+  for (int i = 0; i < nOld; i++) old[i] = wSensors[i];
+  wNSensors = 0;
+  for (int f = 0; f < wScanCount && wNSensors < WEB_MAX_SENSORS; f++) {
+    WSensor s;
+    s.addr = wScanFound[f];
+    for (int i = 0; i < nOld; i++) if (old[i].addr == s.addr) { s = old[i]; break; }
+    wSensors[wNSensors++] = s;
+  }
+}
+
+void wReadInfo(int idx) {
+  String r = sdi12Command(String(wSensors[idx].addr) + "I!", 400);
+  if (r.length() > 1 && r.charAt(0) == wSensors[idx].addr) wSensors[idx].info = r.substring(1);
+}
+
+void wStoreMeas() {
+  int idx = wFindSensor(wJob.target);
+  if (idx < 0) return;
+  WMeas& m = (wJob.mode == 'C') ? wSensors[idx].c : wSensors[idx].m;
+  m.n   = wJob.n;
+  m.t   = wJob.t;
+  m.at  = millis() / 1000;
+  m.raw = wJob.raw;
+}
+
+void wJobStep() {
+  if (wJob.type == WJOB_NONE) return;
+
+  if (wJob.type == WJOB_SCAN) {
+    if (wJob.phase == 0) {
+      char a = sdi12AddrAt(wJob.i);
+      if (sdi12Probe(a)) wScanFound[wScanCount++] = a;
+      if (++wJob.i >= SDI12_NUM_ADDR) { wRebuildList(); wJob.phase = 1; wJob.k = 0; }
+      return;
+    }
+    if (wJob.k < wNSensors) {
+      if (wSensors[wJob.k].info.length() == 0) wReadInfo(wJob.k);
+      wJob.k++;
+      return;
+    }
+    String msg = wNSensors == 1 ? "1 sensor encontrado" : String(wNSensors) + " sensores encontrados";
+    if (wScanCount > WEB_MAX_SENSORS) msg += " (se muestran " + String(WEB_MAX_SENSORS) + ")";
+    wFinishJob(msg, false);
+    return;
+  }
+
+  if (wJob.type == WJOB_INFO) {
+    int idx = wFindSensor(wJob.target);
+    if (idx >= 0) wReadInfo(idx);
+    wFinishJob(idx >= 0 && wSensors[idx].info.length() ? String("Identificación de ") + wJob.target + " leída"
+                                                        : String("El sensor ") + wJob.target + " no respondió a aI!", idx < 0);
+    return;
+  }
+
+  if (wJob.type == WJOB_MEASURE) {
+    if (wJob.phase == 0) {                       // enviar aC! o aM!
+      String r = sdi12Command(String(wJob.target) + wJob.mode + "!", 400);
+      bool ok = r.length() >= 5 && r.charAt(0) == wJob.target;
+      if (!ok && wJob.mode == 'C') {
+        int idx = wFindSensor(wJob.target);
+        if (idx >= 0) { wSensors[idx].c.n = -2; wSensors[idx].c.raw = ""; }
+        wJob.mode = 'M';                         // sin aC!: se mide con aM!
+        return;
+      }
+      if (!ok) { wFinishJob(String("El sensor ") + wJob.target + " no respondió a a" + wJob.mode + "!", true); return; }
+      wJob.t = r.substring(1, 4).toInt();
+      wJob.n = r.substring(4).toInt();
+      wJob.raw = "";
+      wJob.waitStart = millis();
+      wJob.waitMs = (unsigned long)min(wJob.t, WEB_MAX_WAIT_S) * 1000UL + 150UL;
+      wJob.phase = 1;
+      return;
+    }
+    if (wJob.phase == 1) {                       // esperar sin bloquear
+      bool ready = millis() - wJob.waitStart >= wJob.waitMs;
+      if (!ready && wJob.mode == 'M' && digitalRead(SDI12_RX_PIN) != SDI12_RX_MARK) {
+        String sr = sdi12ReadLine(60);           // aviso "a<CR><LF>" de fin de aM!
+        ready = sr.length() > 0 && sr.charAt(0) == wJob.target;
+      }
+      if (ready) { wJob.phase = 2; wJob.k = 0; }
+      return;
+    }
+    String dr = sdi12Command(String(wJob.target) + "D" + String(wJob.k) + "!", 900);
+    String body = (dr.length() > 1 && dr.charAt(0) == wJob.target) ? dr.substring(1) : "";
+    bool hasValues = body.indexOf('+') >= 0 || body.indexOf('-') >= 0;
+    if (hasValues) wJob.raw += body;
+    if (hasValues && ++wJob.k <= 9) return;
+    wStoreMeas();
+    if (wJob.both && wJob.mode == 'C') { wJob.mode = 'M'; wJob.phase = 0; return; }
+    wFinishJob(String("Medición de ") + wJob.target + " lista", false);
+    return;
+  }
+
+  if (wJob.type == WJOB_CHID) {
+    char oldA = wJob.target, newA = wJob.newAddr;
+    if (sdi12Probe(newA))  { wFinishJob(String("El ID ") + newA + " ya está en uso", true); return; }
+    if (!sdi12Probe(oldA)) { wFinishJob(String("El sensor ") + oldA + " no responde", true); return; }
+    sdi12Command(String(oldA) + "A" + newA + "!", 400);
+    bool newOk = sdi12Probe(newA);
+    bool oldGone = !sdi12Probe(oldA);
+    if (!newOk) { wFinishJob(String("No se pudo cambiar el ID de ") + oldA, true); return; }
+    int idx = wFindSensor(oldA);
+    if (idx >= 0) wSensors[idx].addr = newA;
+    for (int a = 0; a < wNSensors; a++)
+      for (int b = a + 1; b < wNSensors; b++)
+        if (sdi12IndexOf(wSensors[b].addr) < sdi12IndexOf(wSensors[a].addr)) { WSensor t = wSensors[a]; wSensors[a] = wSensors[b]; wSensors[b] = t; }
+    wFinishJob(String("ID cambiado: ") + oldA + " -> " + newA + (oldGone ? "" : " (la dirección anterior aún responde)"), false);
+    return;
+  }
+}
+
+String wJobText(int& p, int& t) {
+  p = 0; t = 0;
+  switch (wJob.type) {
+    case WJOB_SCAN:
+      if (wJob.phase == 0) { p = wJob.i; t = SDI12_NUM_ADDR; return "Escaneando " + String(wJob.i) + "/62"; }
+      p = wJob.k; t = wNSensors;
+      return "Leyendo identificación " + String(min(wJob.k + 1, wNSensors)) + "/" + String(wNSensors);
+    case WJOB_INFO:    return String("Leyendo aI! de ") + wJob.target;
+    case WJOB_CHID:    return String("Cambiando ID ") + wJob.target + " -> " + wJob.newAddr;
+    case WJOB_MEASURE: {
+      String m = String("a") + wJob.mode + "!";
+      if (wJob.phase == 0) return "Enviando " + m + " a " + wJob.target;
+      if (wJob.phase == 1) {
+        p = millis() - wJob.waitStart; t = wJob.waitMs;
+        long rest = ((long)wJob.waitMs - p) / 1000;
+        return "Midiendo " + m + " en " + wJob.target + ": faltan " + String(max(rest, 0L)) + " s";
+      }
+      return "Leyendo datos " + m + " (aD" + String(wJob.k) + "!) de " + wJob.target;
+    }
+    default: return "";
+  }
+}
+
+// ---------- JSON ----------
+String jsonEsc(const String& s) {
+  String o;
+  o.reserve(s.length() + 4);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if ((uint8_t)c < 0x20) o += ' ';
+    else o += c;
+  }
+  return o;
+}
+
+// Numero JSON; NaN/inf -> null (JSON no admite NaN)
+void jNum(String& j, float v, int dec) {
+  if (isnan(v) || isinf(v)) j += "null";
+  else j += String(v, dec);
+}
+
+float useHours() {
+  unsigned long el = millis() - estStartTime;
+  if (estMAh <= 0.002f || el <= 5000UL) return NAN;
+  float rate = estMAh / (el / 3600000.0f);          // mAh por hora
+  if (rate <= 0.0001f) return NAN;
+  return BAT_CAPACITY_MAH / rate;
+}
+
+String buildDataJson() {
+  float median = 0, avg = 0;
+  bool statsOk = false;
+  computeCurrentStats(median, avg, statsOk);
+  unsigned long now = millis();
+  String j;
+  j.reserve(3000);
+  j += "{\"fw\":\"0.2.2\",\"up\":"; j += now / 1000;
+  j += ",\"ap\":\""; j += apName; j += "\",\"cl\":"; j += (unsigned int)WiFi.softAPgetStationNum();
+  j += ",\"heap\":"; j += (unsigned long)ESP.getFreeHeap();
+  j += ",\"err\":\""; if (inaFailed) j += "El INA228 no responde: revise el I2C (GP11/GP12). La medición de corriente y los tests están detenidos; el gestor SDI-12 funciona."; j += "\"";
+
+  j += ",\"bat\":{\"v\":"; jNum(j, batteryVoltage, 3); j += ",\"p\":"; j += batteryPercent; j += "}";
+
+  j += ",\"cur\":{\"i\":"; jNum(j, inaFailed ? NAN : currentCurrent, 3);
+  j += ",\"med\":"; jNum(j, statsOk ? median : NAN, 2);
+  j += ",\"max\":"; jNum(j, max_current_mA > 0.0f ? max_current_mA : NAN, 2);
+  j += ",\"min\":"; jNum(j, min_current_mA > 0.0f ? min_current_mA : NAN, 3);
+  j += ",\"v\":";   jNum(j, inaFailed ? NAN : currentVoltage, 3);
+  j += ",\"mah\":"; jNum(j, inaFailed ? NAN : estMAh, 2);
+  j += ",\"avg\":"; jNum(j, statsOk ? avg : NAN, 2);
+  j += ",\"use\":"; jNum(j, useHours(), 1);
+  j += ",\"st\":\""; j += isRecording ? (endingRecording ? "fin" : "rec") : (recordingComplete ? "done" : "wait"); j += "\"";
+  j += ",\"n\":"; j += sampleCount;
+  j += ",\"oc\":"; j += currentCurrent > OC_THRESHOLD ? "true" : "false";
+  j += ",\"paused\":"; j += dischState == DISCH_RUNNING ? "true" : "false";
+  j += ",\"thS\":"; jNum(j, CURRENT_START_THRESHOLD, 2);
+  j += ",\"thO\":"; jNum(j, OC_THRESHOLD, 1);
+  j += "}";
+
+  j += ",\"env\":{\"bt\":"; jNum(j, bmePresent ? envBmeT : NAN, 1);
+  j += ",\"bh\":"; jNum(j, bmePresent ? envBmeH : NAN, 0);
+  j += ",\"bp\":"; jNum(j, bmePresent ? envBmeP : NAN, 0);
+  j += ",\"s30t\":"; jNum(j, sht30Present ? envS30T : NAN, 1);
+  j += ",\"s30h\":"; jNum(j, sht30Present ? envS30H : NAN, 0);
+  j += ",\"s10t\":"; jNum(j, envS10T, 1);
+  j += ",\"s10h\":"; jNum(j, envS10H, 0);
+  j += ",\"age\":"; j += envAt ? (long)((now - envAt) / 1000) : -1L;
+  j += "}";
+
+  j += ",\"ads\":";
+  if (adsPresent) {
+    j += "[";
+    for (int ch = 0; ch < 4; ch++) { if (ch) j += ','; jNum(j, adsV[ch], 4); }
+    j += "]";
+  } else j += "null";
+  j += ",\"p1\":"; j += gpioP1 ? 1 : 0;
+  j += ",\"p2\":"; j += gpioP2 ? 1 : 0;
+  j += ",\"urx\":"; j += gpioUrx ? 1 : 0;
+
+  j += ",\"uart\":[";
+  for (int i = 0; i < UART_BUF_LINES; i++) {
+    if (i) j += ',';
+    j += '"'; j += jsonEsc(String(uartLines[i])); j += '"';
+  }
+  j += "]";
+
+  j += ",\"soil\":{\"ok\":"; j += soil_dataReady ? "true" : "false";
+  j += ",\"age\":"; j += soil_dataReady ? (long)((now - lastSoilParse) / 1000) : -1L;
+  j += ",\"h\":["; for (int i = 0; i < 12; i++) { if (i) j += ','; jNum(j, soil_hum[i], 1); }
+  j += "],\"t\":["; for (int i = 0; i < 13; i++) { if (i) j += ','; jNum(j, soil_temp[i], 1); }
+  j += "]}";
+
+  unsigned long el = now - sa_testStart;
+  j += ",\"sa\":{\"st\":\""; j += testerStateSA == SA_TESTING ? "test" : (testerStateSA == SA_RESULT ? "res" : "idle"); j += "\"";
+  j += ",\"prog\":"; j += testerStateSA == SA_TESTING ? (int)min(100UL, el * 100UL / SA_TEST_DURATION) : 0;
+  j += ",\"pass\":"; j += sa_passed ? "true" : "false";
+  j += ",\"why\":\""; j += jsonEsc(sa_failReason); j += "\"";
+  j += ",\"i\":"; jNum(j, sa_current, 1); j += ",\"a0\":"; jNum(j, sa_a0v, 3); j += ",\"a1\":"; jNum(j, sa_a1v, 3);
+  j += ",\"ok\":["; j += sa_currentOk ? 1 : 0; j += ','; j += sa_a0Ok ? 1 : 0; j += ','; j += sa_a1Ok ? 1 : 0;
+  j += ','; j += sa_pulse1Ok ? 1 : 0; j += ','; j += sa_pulse2Ok ? 1 : 0; j += "]}";
+
+  j += ",\"wx\":{\"st\":\""; j += testerStateWX == WX_TESTING ? "test" : (testerStateWX == WX_RESULT ? "res" : "idle"); j += "\"";
+  j += ",\"prog\":"; j += testerStateWX == WX_TESTING ? (int)min(100UL, el * 100UL / 4000UL) : 0;
+  j += ",\"pass\":"; j += wx_passed ? "true" : "false";
+  j += ",\"why\":\""; j += jsonEsc(wx_failReason); j += "\"";
+  j += ",\"i\":"; jNum(j, wx_current, 1);
+  j += ",\"bt\":"; jNum(j, wx_bme_temp, 1); j += ",\"bh\":"; jNum(j, wx_bme_hum, 0);
+  j += ",\"tt\":"; jNum(j, wx_sht_temp, 1); j += ",\"th\":"; jNum(j, wx_sht_hum, 0);
+  j += ",\"ok\":["; j += wx_currentOk ? 1 : 0; j += ','; j += wx_sht10Ok ? 1 : 0; j += ','; j += wx_sht30Ok ? 1 : 0; j += "]}";
+
+  j += ",\"dis\":{\"st\":\""; j += dischState == DISCH_RUNNING ? "run" : (dischState == DISCH_DONE ? "done" : "idle"); j += "\"";
+  j += ",\"v\":"; jNum(j, disch_voltage, 3); j += ",\"i\":"; jNum(j, disch_current, 1);
+  j += ",\"mah\":"; jNum(j, disch_mAh, 2); j += ",\"mwh\":"; jNum(j, disch_mWh, 1);
+  j += ",\"s\":"; j += disch_duration / 1000; j += ",\"pk\":"; jNum(j, disch_peakCurrent, 1);
+  j += ",\"pct\":"; jNum(j, BAT_CAPACITY_MAH > 0 ? disch_mAh / BAT_CAPACITY_MAH * 100.0f : NAN, 0);
+  j += "}}";
+  return j;
+}
+
+String buildSamplesJson() {
+  String j;
+  j.reserve(64 + sampleCount * 30);
+  j += "{\"n\":"; j += sampleCount;
+  j += ",\"t\":["; for (int i = 0; i < sampleCount; i++) { if (i) j += ','; jNum(j, recordedTimes[i] / 1000.0f, 1); }
+  j += "],\"i\":["; for (int i = 0; i < sampleCount; i++) { if (i) j += ','; jNum(j, recordedCurrents[i], 3); }
+  j += "],\"q\":["; for (int i = 0; i < sampleCount; i++) { if (i) j += ','; jNum(j, recordedMAh[i], 3); }
+  j += "]}";
+  return j;
+}
+
+void wMeasJson(String& j, const WMeas& m) {
+  j += "{\"n\":"; j += m.n;
+  j += ",\"t\":"; j += m.t;
+  j += ",\"at\":"; j += m.at;
+  j += ",\"raw\":\""; j += jsonEsc(m.raw); j += "\"}";
+}
+
+String buildSdiJson() {
+  int p, t;
+  String txt = wJobText(p, t);
+  String j;
+  j.reserve(1024 + wNSensors * 400);
+  j += "{\"up\":"; j += millis() / 1000;
+  j += ",\"ap\":\""; j += apName; j += "\"";
+  j += ",\"busy\":"; j += wJob.type != WJOB_NONE ? "true" : "false";
+  j += ",\"dev\":"; j += sdi12OledBusy() ? "true" : "false";
+  j += ",\"a\":\""; if (wJob.target) j += wJob.target; j += "\"";
+  j += ",\"p\":"; j += p; j += ",\"t\":"; j += t;
+  j += ",\"txt\":\""; j += jsonEsc(txt); j += "\"";
+  j += ",\"msg\":\""; j += jsonEsc(wLastMsg); j += "\"";
+  j += ",\"err\":"; j += wLastErr ? "true" : "false";
+  j += ",\"sensors\":[";
+  for (int i = 0; i < wNSensors; i++) {
+    if (i) j += ',';
+    j += "{\"a\":\""; j += wSensors[i].addr; j += "\"";
+    j += ",\"i\":\""; j += jsonEsc(wSensors[i].info); j += "\"";
+    j += ",\"c\":"; wMeasJson(j, wSensors[i].c);
+    j += ",\"m\":"; wMeasJson(j, wSensors[i].m);
+    j += "}";
+  }
+  j += "]}";
+  return j;
+}
+
+String buildCfgJson() {
+  String j = "{";
+  j += "\"start\":";   jNum(j, CURRENT_START_THRESHOLD, 3);
+  j += ",\"end\":";    jNum(j, CURRENT_END_THRESHOLD, 3);
+  j += ",\"period\":"; jNum(j, SAMPLE_PERIOD / 1000.0f, 2);
+  j += ",\"maxt\":";   jNum(j, MAX_RECORD_TIME / 1000.0f, 1);
+  j += ",\"oc\":";     jNum(j, OC_THRESHOLD, 2);
+  j += ",\"samples\":"; j += MAX_SAMPLES_CONFIG;
+  j += ",\"bat\":";    jNum(j, BAT_CAPACITY_MAH, 0);
+  j += ",\"vref\":";   jNum(j, SA_VOLT_REF, 3);
+  j += ",\"vtol\":";   jNum(j, SA_VOLT_TOL * 100.0f, 2);
+  j += ",\"imin\":";   jNum(j, SA_CURR_MIN, 3);
+  j += ",\"imax\":";   jNum(j, SA_CURR_MAX, 2);
+  j += ",\"dlim\":";   jNum(j, DISCH_CURR_LIMIT, 1);
+  j += "}";
+  return j;
+}
+
+// ---------- handlers HTTP ----------
+void webJson(int code, const String& body) {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(code, "application/json; charset=utf-8", body);
+}
+void webOk() { webJson(200, "{\"ok\":true}"); }
+void webErr(int code, const String& msg) { webJson(code, "{\"ok\":false,\"err\":\"" + jsonEsc(msg) + "\"}"); }
+
+bool inaGuard() {
+  if (!inaFailed) return false;
+  webErr(503, "El INA228 no responde: la medición y los tests están detenidos");
+  return true;
+}
+
+void hRoot() {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send_P(200, "text/html; charset=utf-8", PAGE);
+}
+
+void hData() {
+  if (webServer.hasArg("sen")) {         // pestana Sensores abierta: leerlos
+    if (millis() - webSenHit > WEB_ACTIVE_MS) { webTAds = 0; webTEnv = 0; webTS10 = 0; }   // refresco inmediato
+    webSenHit = millis();
+  }
+  webJson(200, buildDataJson());
+}
+
+void hSamples() { webJson(200, buildSamplesJson()); }
+
+void hCurReset() {
+  if (inaGuard()) return;
+  if (dischState == DISCH_RUNNING) { webErr(409, "Hay una descarga de batería en curso"); return; }
+  resetRecording();
+  webOk();
+}
+
+bool anyTestRunning() {
+  return testerStateSA == SA_TESTING || testerStateWX == WX_TESTING || dischState == DISCH_RUNNING;
+}
+
+void hTest() {
+  if (inaGuard()) return;
+  if (anyTestRunning()) { webErr(409, "Ya hay una prueba en curso"); return; }
+  String t = webServer.arg("t");
+  if (t == "sa") {
+    testerStateSA = SA_TESTING;
+    sa_testStart  = millis();
+    sa_pulseReset = true;
+    sa_passed     = false;
+    sa_failReason = "";
+  } else if (t == "wx") {
+    testerStateWX = WX_TESTING;
+    sa_testStart  = millis();
+    wx_passed     = false;
+    wx_failReason = "";
+  } else { webErr(400, "Prueba desconocida"); return; }
+  webOk();
+}
+
+void hDisch() {
+  if (inaGuard()) return;
+  String op = webServer.arg("op");
+  if (op == "start") {
+    if (anyTestRunning()) { webErr(409, "Ya hay una prueba en curso"); return; }
+    dischState        = DISCH_RUNNING;
+    disch_startTime   = millis();
+    disch_lastSample  = millis();
+    disch_mAh         = 0;
+    disch_mWh         = 0;
+    disch_peakCurrent = 0;
+    ina228.resetAccumulators();
+  } else if (op == "stop") {
+    if (dischState == DISCH_RUNNING) dischState = DISCH_DONE;
+  } else { webErr(400, "Operación desconocida"); return; }
+  webOk();
+}
+
+void hCfgGet() { webJson(200, buildCfgJson()); }
+
+// Lee un parametro numerico de la peticion; false si no vino o no es valido
+bool cfgArg(const char* key, float& out, float lo, float hi) {
+  if (!webServer.hasArg(key)) return false;
+  String s = webServer.arg(key);
+  s.trim();
+  if (s.length() == 0) return false;
+  float v = s.toFloat();
+  if (isnan(v) || v < lo || v > hi) return false;
+  out = v;
+  return true;
+}
+
+void hCfgSet() {
+  float v;
+  int oldSamples = MAX_SAMPLES_CONFIG;
+  if (cfgArg("start", v, 0, 100000))  CURRENT_START_THRESHOLD = v;
+  if (cfgArg("end", v, 0, 100000))    CURRENT_END_THRESHOLD   = v;
+  if (cfgArg("period", v, 0.1f, 3600)) SAMPLE_PERIOD          = (unsigned long)(v * 1000.0f);
+  if (cfgArg("maxt", v, 1, 86400))    MAX_RECORD_TIME         = (unsigned long)(v * 1000.0f);
+  if (cfgArg("oc", v, 0, 100000))     OC_THRESHOLD            = v;
+  if (cfgArg("samples", v, 10, 2000)) MAX_SAMPLES_CONFIG      = (int)v;
+  if (cfgArg("bat", v, 1, 1000000))   BAT_CAPACITY_MAH        = v;
+  if (cfgArg("vref", v, 0, 10))       SA_VOLT_REF             = v;
+  if (cfgArg("vtol", v, 0, 100))      SA_VOLT_TOL             = v / 100.0f;
+  if (cfgArg("imin", v, 0, 100000))   SA_CURR_MIN             = v;
+  if (cfgArg("imax", v, 0, 100000))   SA_CURR_MAX             = v;
+  if (cfgArg("dlim", v, 0, 100000))   DISCH_CURR_LIMIT        = v;
+  if (MAX_SAMPLES_CONFIG != oldSamples) {
+    reallocArrays();
+    if (!inaFailed) resetRecording();
+  }
+  saveConfig();
+  webOk();
+}
+
+void hCfgReset() {
+  restoreDefaults();                // incluye reallocArrays() y saveConfig()
+  if (!inaFailed) resetRecording();
+  webOk();
+}
+
+// SDI-12 desde la web
+bool wBusy() {
+  if (wJob.type != WJOB_NONE) { webErr(409, "Ocupado: espere a que termine la operación en curso"); return true; }
+  if (sdi12OledBusy())        { webErr(409, "El equipo está usando el bus SDI-12 desde su pantalla"); return true; }
+  return false;
+}
+
+bool wArgSensor(char& a) {
+  String s = webServer.arg("a");
+  a = s.length() == 1 ? s.charAt(0) : 0;
+  if (sdi12IndexOf(a) < 0 || wFindSensor(a) < 0) { webErr(400, "Sensor no válido: escanee de nuevo"); return false; }
+  return true;
+}
+
+void hSdi() { webJson(200, buildSdiJson()); }
+
+void hSdiScan() {
+  if (wBusy()) return;
+  wJob = WJob();
+  wJob.type = WJOB_SCAN;
+  wScanCount = 0;
+  wLastMsg = "";
+  webOk();
+}
+
+void hSdiInfo() {
+  char a;
+  if (wBusy() || !wArgSensor(a)) return;
+  wJob = WJob();
+  wJob.type = WJOB_INFO;
+  wJob.target = a;
+  webOk();
+}
+
+void hSdiMeasure() {
+  char a;
+  if (wBusy() || !wArgSensor(a)) return;
+  String m = webServer.arg("m");
+  wJob = WJob();
+  wJob.type = WJOB_MEASURE;
+  wJob.target = a;
+  wJob.both = (m == "B");
+  wJob.mode = (m == "M") ? 'M' : 'C';
+  webOk();
+}
+
+void hSdiChid() {
+  char a;
+  if (wBusy() || !wArgSensor(a)) return;
+  String n = webServer.arg("n");
+  char na = n.length() == 1 ? n.charAt(0) : 0;
+  if (sdi12IndexOf(na) < 0 || wFindSensor(na) >= 0) { webErr(400, "El ID nuevo no es válido o ya está en uso"); return; }
+  wJob = WJob();
+  wJob.type = WJOB_CHID;
+  wJob.target = a;
+  wJob.newAddr = na;
+  webOk();
+}
+
+// Portal cautivo: cualquier otra URL (pruebas de conexion de Android, iOS y
+// Windows incluidas) redirige a la pagina del equipo
+void hPortal() {
+  webServer.sendHeader("Location", String("http://") + AP_IP.toString() + "/", true);
+  webServer.send(302, "text/plain", "");
+}
+
+void webSetup() {
+  WiFi.mode(WIFI_AP);
+  uint8_t mac[6] = {0};
+  WiFi.softAPmacAddress(mac);
+  char ssid[16];
+  snprintf(ssid, sizeof(ssid), "LemPDA-%02X%02X", mac[4], mac[5]);
+  apName = ssid;
+  WiFi.softAPConfig(AP_IP, AP_IP, AP_MASK, IPAddress((uint32_t)0), AP_IP);   // DNS = el equipo
+  if (!WiFi.softAP(ssid, AP_PASS)) Serial.println("ERROR: no se pudo crear la red WiFi");
+  webDns.start(53, "*", AP_IP);
+
+  webServer.on("/", HTTP_GET, hRoot);
+  webServer.on("/api/data", HTTP_GET, hData);
+  webServer.on("/api/samples", HTTP_GET, hSamples);
+  webServer.on("/api/cur/reset", HTTP_POST, hCurReset);
+  webServer.on("/api/test", HTTP_POST, hTest);
+  webServer.on("/api/disch", HTTP_POST, hDisch);
+  webServer.on("/api/cfg", HTTP_GET, hCfgGet);
+  webServer.on("/api/cfg", HTTP_POST, hCfgSet);
+  webServer.on("/api/cfg/reset", HTTP_POST, hCfgReset);
+  webServer.on("/api/sdi", HTTP_GET, hSdi);
+  webServer.on("/api/sdi/scan", HTTP_POST, hSdiScan);
+  webServer.on("/api/sdi/info", HTTP_POST, hSdiInfo);
+  webServer.on("/api/sdi/measure", HTTP_POST, hSdiMeasure);
+  webServer.on("/api/sdi/chid", HTTP_POST, hSdiChid);
+  webServer.onNotFound(hPortal);
+  webServer.begin();
+  Serial.printf("Red %s (clave %s) -> http://%s/\n", ssid, AP_PASS, AP_IP.toString().c_str());
+}
+
+// Llamada en cada vuelta del loop
+void webLoop() {
+  webDns.processNextRequest();      // en el core 3.x el DNS es asincrono; no hace dano
+  webServer.handleClient();
+  wJobStep();
+
+  // Sensores para la web: solo se leen con la pestana Sensores abierta
+  unsigned long now = millis();
+  if (now - webSenHit > WEB_ACTIVE_MS) return;
+  if (now - webTAds >= 1000UL) {
+    webTAds = now;
+    if (adsPresent) for (int ch = 0; ch < 4; ch++) adsV[ch] = ads.readADC_SingleEnded(ch) * 0.000125f;
+    gpioP1  = digitalRead(PULSE1_PIN);
+    gpioP2  = digitalRead(PULSE2_PIN);
+    gpioUrx = digitalRead(UART_RX_PIN);
+  }
+  if (now - webTEnv >= 5000UL) {
+    webTEnv = now;
+    if (bmePresent)   { envBmeT = bme.readTemperature(); envBmeH = bme.readHumidity(); envBmeP = bme.readPressure() / 100.0f; }
+    if (sht30Present) { envS30T = sht30.readTemperature(); envS30H = sht30.readHumidity(); }
+    envAt = now;
+  }
+  if (now - webTS10 >= 15000UL) {   // el SHT10 bloquea ~0,7 s por lectura
+    webTS10 = now;
+    envS10T = sht10.readTemperatureC();
+    envS10H = sht10.readHumidity();
+    if (!sht10Valid(envS10T, envS10H)) { envS10T = NAN; envS10H = NAN; }   // sin sensor: -40.1 C
+  }
 }
