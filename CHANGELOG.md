@@ -9,15 +9,24 @@ Convenciones:
 ## 0.1.6 - ESP32-C3 sin pantalla ni botones (solo web)
 Carpeta `CODE/V0.1.6/tester_esp32_v0_1_6/`, con `tester_esp32_v0_1_6.ino` e `index_html.h` en la misma carpeta.
 - La misma GUI web y la misma red que la 0.2.2 (`LemPDA-XXXX`, clave `12345678`, `http://192.168.4.1`), sin OLED, encoder ni botones.
-- La lógica de medición y de los tests es la de la 0.1.5, con sus arreglos. Los pines son los mismos; GP0, GP1, GP2, GP3 y GP5 quedan libres.
-- En el C3 el bus SDI-12 comparte GP6/GP7 con Pulse1, Pulse2 y el SHT10:
-  - La web no usa el bus mientras corre Sense-QC o Weather-QC.
-  - Sense-QC y Weather-QC no arrancan mientras el bus está en uso.
-  - El SHT10 no se lee mientras el bus está en uso.
-  - Al terminar, los pines vuelven a quedar como entrada.
+- **I2C movido a SDA = GP0 y SCL = GP1** (antes GP8/GP9). GP0 y GP1 eran el encoder y no son pines de strapping. GP8 queda para el LED RGB.
+- LED RGB de estado en GP8 (`USE_RGB_LED`):
+  - rojo fijo: el INA228 no responde;
+  - rojo fuerte: sobrecorriente;
+  - rojo parpadeando: grabando corriente;
+  - azul: un test, la descarga o el bus SDI-12 en curso;
+  - verde tenue: listo.
+- Libres: GP2, GP3, GP4, GP5, GP9 y GP21.
+- La lógica de medición y de los tests es la de la 0.1.5, con sus arreglos.
+- En el C3, GP7 es a la vez SDI-12 TX, Pulse2 y el dato del SHT10, y GP6 es SDI-12 RX y Pulse1:
+  - La web no usa el bus SDI-12 mientras corre Sense-QC o Weather-QC, y esos tests no arrancan mientras el bus está en uso.
+  - El SHT10 se lee solo con el botón "Leer SHT10", nunca en segundo plano.
+  - Sense-QC vuelve a poner GP6 y GP7 como entradas antes de empezar.
+- El INA228 se lee cada 50 ms, porque con el promedio de 128 su dato cambia cada ~0,4 s.
 - La batería se mide por el ADS1115 (A3). Si falta el ADS1115, la web muestra "Sin dato de batería".
 - La potencia WiFi está en 8,5 dBm, porque muchos C3 SuperMini fallan a potencia máxima.
 - Sin INA228, la web sigue funcionando: muestra el error y el gestor SDI-12 sigue disponible.
+- Arreglado: en la primera subida de la 0.1.6, el JSON de `/api/data` salía inválido por un comentario mal ubicado, y la página no recibía datos.
 
 ## 0.2.2 - ESP32-S3 LOLIN Mini (portal web)
 Carpeta `CODE/V0.2.2/esp-s3-v0.2.2/`, con `esp-s3-v0.2.2.ino` e `index_html.h` en la misma carpeta.

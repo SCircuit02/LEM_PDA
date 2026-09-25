@@ -14,11 +14,19 @@
  * Es la misma GUI de la 0.2.2 (S3). La pagina va en index_html.h, en la misma
  * carpeta que este .ino.
  *
- * Pines (los mismos de la 0.1.5; GP0/1/2/3/5 del encoder y botones quedan libres):
- *   GP8=SDA GP9=SCL (INA228, ADS1115, BME280, SHT30)
+ * Pines (cambia el I2C respecto de la 0.1.5):
+ *   GP0=SDA GP1=SCL (INA228, ADS1115, BME280, SHT30) - antes era GP8/GP9;
+ *        GP0/GP1 eran el encoder, no son strapping y quedan juntos en la placa
+ *   GP8=LED RGB WS2812 onboard (estado del equipo; GP8 es strapping, el LED
+ *        no lo afecta)
  *   GP6=Pulse1 / SDI-12 RX   GP7=Pulse2 / SDI-12 TX / SHT10 data
  *   GP10=SHT10 clk   GP20=UART monitor RX
+ *   Libres: GP2 (strapping), GP3, GP4, GP5, GP9 (strapping/BOOT), GP21
  *   Bateria: ADS1115 A3 (divisor 2:1)
+ * LED de estado: rojo fijo = INA228 no responde; rojo fuerte = sobrecorriente;
+ * rojo parpadeando = grabando corriente; azul = test, descarga o SDI-12 en
+ * curso; verde tenue = listo. Poner USE_RGB_LED en 0 si la placa no tiene
+ * WS2812 en GP8 (por ejemplo, un LED azul simple).
  * En el C3 el bus SDI-12 comparte GP6/GP7 con Sense-QC y Weather-QC: la web
  * no deja usar ambos a la vez.
  *
@@ -41,8 +49,10 @@
 // ============================================
 // PIN DEFINITIONS (ESP32-C3)
 // ============================================
-#define SDA_PIN     8    // en los C3 con LED en GPIO8 el LED queda en el bus: no se usa
-#define SCL_PIN     9
+#define SDA_PIN     0    // I2C movido desde GP8/GP9 para dejar GP8 al LED RGB
+#define SCL_PIN     1
+#define RGB_LED_PIN 8    // WS2812 onboard de los C3 con LED RGB
+#define USE_RGB_LED 1    // 0 si la placa no tiene WS2812 en GP8
 #define PULSE1_PIN  6
 #define PULSE2_PIN  7
 #define UART_RX_PIN 20
@@ -58,8 +68,8 @@
 // El bus SDI-12 es logica invertida (marca/idle ~0V, espacio ~5V). Con una
 // inversion en TX y una en RX, ambas cancelan la del bus => el MCU ve un UART
 // estandar NO invertido: reposo/marca = ALTO, start/espacio = BAJO.
-#define SDI12_TX_PIN    7   // hacia el bus (compartido con PULSE2)
-#define SDI12_RX_PIN    6   // desde el bus (compartido con PULSE1 / SHT10 data)
+#define SDI12_TX_PIN    7   // hacia el bus (compartido con PULSE2 y SHT10 data)
+#define SDI12_RX_PIN    6   // desde el bus (compartido con PULSE1)
 
 // Niveles GPIO (cambiar a la inversa solo si el banco lo exige)
 #define SDI12_TX_MARK   HIGH   // reposo / bit 1 / stop
@@ -141,9 +151,6 @@ float currentMAh        = 0.0f;
 float max_current_mA    = 0.0f;
 float min_current_mA    = 0.0f;   // corriente minima > 0 observada (capta uA)
 
-// Vista de corriente: 2 paginas
-int   currentViewPage   = 0;      // 0 = pag1 (mA/med/min/max), 1 = pag2 (V/mAh/prom/uso)
-
 // Estimacion de uso (independiente del registro del grafico)
 float estMAh            = 0.0f;   // carga integrada por software desde que se entro
 unsigned long estStartTime = 0;   // inicio de la medicion de la vista
@@ -159,13 +166,10 @@ bool          isRecording       = false;
 bool          recordingComplete = false;
 unsigned long recordStartTime   = 0;
 unsigned long lastSampleTime    = 0;
-int           tableScrollOffset = 0;
 
 bool          endingRecording   = false;
 unsigned long endRecordingTime  = 0;
 const unsigned long END_DELAY   = 3000;
-
-float ina_avgCurrent = 0.0f;
 
 // ============================================
 // SENSE-QC TESTER
@@ -496,7 +500,6 @@ void resetRecording() {
   max_current_mA    = 0;
   min_current_mA    = 0;
   currentMAh        = 0;
-  currentViewPage   = 0;
   estMAh            = 0;
   estStartTime      = millis();
   estLastTime       = 0;
@@ -813,8 +816,33 @@ void updateDischarge() {
 }
 
 // ============================================
-// BATERIA (ADS1115 A3, divisor 2:1)
+// LED DE ESTADO Y BATERIA
 // ============================================
+// LED RGB de estado (el equipo no tiene pantalla). Colores tenues y solo se
+// reescribe cuando cambia.
+void rgbSet(uint8_t r, uint8_t g, uint8_t b) {
+#if USE_RGB_LED
+  static int lr = -1, lg = -1, lb = -1;
+  if (r == lr && g == lg && b == lb) return;
+  rgbLedWrite(RGB_LED_PIN, r, g, b);
+  lr = r; lg = g; lb = b;
+#else
+  (void)r; (void)g; (void)b;
+#endif
+}
+
+void updateStatusLED() {
+  static unsigned long lastBlink = 0;
+  static bool blinkOn = false;
+  if (millis() - lastBlink > 400) { blinkOn = !blinkOn; lastBlink = millis(); }
+  if (inaFailed)                                   rgbSet(40, 0, 0);
+  else if (dischState == DISCH_RUNNING || testerStateSA == SA_TESTING ||
+           testerStateWX == WX_TESTING || wJob.type != WJOB_NONE) rgbSet(0, 0, 30);
+  else if (currentCurrent > OC_THRESHOLD)          rgbSet(60, 0, 0);
+  else if (isRecording)                            rgbSet(blinkOn ? 25 : 0, 0, 0);
+  else                                             rgbSet(0, 6, 0);
+}
+
 void updateBattery() {
   if (!adsPresent) { batteryVoltage = NAN; batteryPercent = 0; return; }   // sin ADS no hay dato
   int16_t adc3  = ads.readADC_SingleEnded(3);
@@ -839,8 +867,8 @@ void updateSerialInputs() {
 
 // =====================================================================
 //  PORTAL WEB (igual que la 0.2.2 del S3): red propia LemPDA-XXXX, portal cautivo y API JSON
-//  La web muestra todos los datos del equipo sin usar pantalla, encoder ni
-//  botones. El equipo sigue funcionando igual con su pantalla.
+//  En el C3 (0.1.6) la web es la unica interfaz: no hay pantalla, encoder ni
+//  botones.
 // =====================================================================
 #include "index_html.h"      // pagina web (PAGE)
 
@@ -1055,9 +1083,10 @@ String buildDataJson() {
   j += ",\"ap\":\""; j += apName; j += "\",\"cl\":"; j += (unsigned int)WiFi.softAPgetStationNum();
   j += ",\"heap\":"; j += (unsigned long)ESP.getFreeHeap();
   j += ",\"sdib\":"; j += wJob.type != WJOB_NONE ? "true" : "false";   // bus SDI-12 en uso
-  j += ",\"err\":\""; if (inaFailed) j += "El INA228 no responde: revise el I2C (GP8/GP9). La medición de corriente y los tests están detenidos; el gestor SDI-12 funciona."; j += "\"";
+  j += ",\"err\":\""; if (inaFailed) j += "El INA228 no responde: revise el I2C (SDA GP0 / SCL GP1). La medición de corriente y los tests están detenidos; el gestor SDI-12 funciona."; j += "\"";
 
-  j += ",\"bat\":{\"v\":"; jNum(j, batteryVoltage, 3);   // NaN -> null si no hay ADS1115 j += ",\"p\":"; j += batteryPercent; j += "}";
+  // Bateria: v = null si no hay ADS1115 (la bateria se mide en su A3)
+  j += ",\"bat\":{\"v\":"; jNum(j, batteryVoltage, 3); j += ",\"p\":"; j += batteryPercent; j += "}";
 
   j += ",\"cur\":{\"i\":"; jNum(j, inaFailed ? NAN : currentCurrent, 3);
   j += ",\"med\":"; jNum(j, statsOk ? median : NAN, 2);
@@ -1244,6 +1273,8 @@ void hTest() {
   if (wJob.type != WJOB_NONE) { webErr(409, "El bus SDI-12 está en uso y comparte pines con esta prueba: espere"); return; }
   String t = webServer.arg("t");
   if (t == "sa") {
+    pinMode(PULSE1_PIN, INPUT);          // GP6/GP7 como entradas aunque antes los
+    pinMode(PULSE2_PIN, INPUT);          // usara el SDI-12 o el SHT10
     testerStateSA = SA_TESTING;
     sa_testStart  = millis();
     sa_pulseReset = true;
@@ -1263,6 +1294,7 @@ void hDisch() {
   String op = webServer.arg("op");
   if (op == "start") {
     if (anyTestRunning()) { webErr(409, "Ya hay una prueba en curso"); return; }
+    if (isRecording) { stopRecording(); endingRecording = false; }
     dischState        = DISCH_RUNNING;
     disch_startTime   = millis();
     disch_lastSample  = millis();
@@ -1316,6 +1348,24 @@ void hCfgSet() {
 void hCfgReset() {
   restoreDefaults();                // incluye reallocArrays() y saveConfig()
   if (!inaFailed) resetRecording();
+  webOk();
+}
+
+// SHT10 a pedido (boton "Leer SHT10"). En el C3 su linea de datos es GP7, la
+// misma de Pulse2 y SDI-12 TX: no se lee si el bus o un test usan esos pines.
+void hSht10() {
+  if (wJob.type != WJOB_NONE || sdi12PinsBusy()) {
+    webErr(409, "Espere: el bus SDI-12 o un test están usando GP7");
+    return;
+  }
+  envS10T = sht10.readTemperatureC();
+  envS10H = sht10.readHumidity();
+  pinMode(SHT10_DATA_PIN, INPUT);        // GP7 vuelve a ser entrada (Pulse2)
+  if (!sht10Valid(envS10T, envS10H)) {   // sin sensor la libreria da -40.1 C
+    envS10T = NAN; envS10H = NAN;
+    webErr(504, "El SHT10 no respondió");
+    return;
+  }
   webOk();
 }
 
@@ -1409,6 +1459,7 @@ void webSetup() {
   webServer.on("/api/cfg", HTTP_POST, hCfgSet);
   webServer.on("/api/cfg/reset", HTTP_POST, hCfgReset);
   webServer.on("/api/sdi", HTTP_GET, hSdi);
+  webServer.on("/api/sht10", HTTP_POST, hSht10);
   webServer.on("/api/sdi/scan", HTTP_POST, hSdiScan);
   webServer.on("/api/sdi/info", HTTP_POST, hSdiInfo);
   webServer.on("/api/sdi/measure", HTTP_POST, hSdiMeasure);
@@ -1440,12 +1491,8 @@ void webLoop() {
     if (sht30Present) { envS30T = sht30.readTemperature(); envS30H = sht30.readHumidity(); }
     envAt = now;
   }
-  if (now - webTS10 >= 15000UL && wJob.type == WJOB_NONE) {   // SHT10 comparte GP7 con SDI-12; bloquea ~0,7 s
-    webTS10 = now;
-    envS10T = sht10.readTemperatureC();
-    envS10H = sht10.readHumidity();
-    if (!sht10Valid(envS10T, envS10H)) { envS10T = NAN; envS10H = NAN; }   // sin sensor: -40.1 C
-  }
+  // El SHT10 no se lee en segundo plano: en el C3 su linea de datos es GP7
+  // (Pulse2 / SDI-12 TX). Se lee solo con el boton de la web (hSht10).
 }
 
 // ============================================
@@ -1453,6 +1500,7 @@ void webLoop() {
 // ============================================
 void setup() {
   Serial.begin(115200);
+  rgbSet(0, 0, 25);              // azul = arrancando
 
   EEPROM.begin(EEPROM_SIZE);
   loadConfig();
@@ -1471,7 +1519,7 @@ void setup() {
   // INA228: sin el no hay medicion ni tests, pero la web y el SDI-12 siguen
   inaFailed = !ina228.begin();
   if (inaFailed) {
-    Serial.println("ERROR: el INA228 no responde (I2C GP8/GP9). Solo web y SDI-12.");
+    Serial.println("ERROR: el INA228 no responde (I2C SDA=GP0 SCL=GP1). Solo web y SDI-12.");
   } else {
     ina228.setShunt(0.015, 20.0);
     ina228.setAveragingCount(INA228_COUNT_128);
@@ -1502,8 +1550,11 @@ void loop() {
   if (!inaFailed) {
     // Corriente: siempre, salvo durante la descarga de bateria (que usa el
     // acumulador de carga del INA228)
+    // El INA228 promedia 128 conversiones (~0,4 s por dato): leerlo cada 50 ms
+    // basta y no satura el I2C ni el unico nucleo del C3, que tambien usa el WiFi
     if (dischState != DISCH_RUNNING) {
-      updateCurrentReadings();
+      static unsigned long lastCur = 0;
+      if (millis() - lastCur >= 50) { lastCur = millis(); updateCurrentReadings(); }
       handleRecording();
     }
     // Tests y descarga (cada uno no hace nada si no esta activo)
@@ -1516,5 +1567,6 @@ void loop() {
 
   // Red WiFi, portal web y tareas SDI-12 pedidas desde la web
   webLoop();
+  updateStatusLED();
   delay(2);
 }

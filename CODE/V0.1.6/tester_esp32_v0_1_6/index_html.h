@@ -87,7 +87,7 @@ select{font:inherit;padding:10px;border-radius:10px;background:var(--bg);color:v
 
 <section id="t-sen" class="tab">
 <div class="box"><h2>Batería del equipo</h2><div id="sBat"></div></div>
-<div class="box"><h2>Temperatura y humedad</h2><div id="sEnv"></div><p class="mut" id="sEnvAge"></p></div>
+<div class="box"><h2>Temperatura y humedad</h2><div id="sEnv"></div><p class="mut" id="sEnvAge"></p><div class="row"><button class="btn2" onclick="s10()">Leer SHT10</button></div></div>
 <div class="box"><h2>ADS1115</h2><div id="sAds"></div></div>
 <div class="box"><h2>Entradas digitales</h2><div id="sGpio"></div></div>
 <div class="box"><h2>Soil-QC (sonda DFM)</h2><div id="sSoil"></div></div>
@@ -220,7 +220,7 @@ function rSen(){const e=D.env,b=D.bat;
   return`<tr><td>${n}</td><td>${has?f(t,1)+' °C':'--'}</td><td>${hh!=null?f(hh,0)+' %':'--'}</td><td>${d}</td><td>${has?s:'<span class="mut">sin lectura</span>'}</td></tr>`};
  $('sEnv').innerHTML='<table><tr><th>Sensor</th><th>Temp</th><th>Hum</th><th>Dif. T</th><th></th></tr>'+row('BME280',e.bt,e.bh,1)+row('SHT30',e.s30t,e.s30h)+row('SHT10',e.s10t,e.s10h)+'</table>'+
   (e.bp!=null?`<p class="mut">Presión (BME280): ${f(e.bp,0)} hPa</p>`:'');
- $('sEnvAge').textContent=(e.age<0?'Aún sin lectura. ':'Actualizado hace '+e.age+' s. ')+`OK = dentro de ±${TT} °C y ±${TH} % del BME280. Se leen solo mientras esta pestaña está abierta (el SHT10 cada 15 s).`;
+ $('sEnvAge').textContent=(e.age<0?'Aún sin lectura. ':'Actualizado hace '+e.age+' s. ')+`OK = dentro de ±${TT} °C y ±${TH} % del BME280. Se leen solo mientras esta pestaña está abierta. El SHT10 se lee solo con el botón: su línea de datos es GP7, compartida con Pulse2 y SDI-12 (no lo use con una placa Sense-QC conectada).`;
  $('sAds').innerHTML=D.ads?tbl(D.ads.map((v,k)=>['A'+k,f(v,4)+' V'])):'<p class="mut">ADS1115 no detectado (A0/A1 se usan en Sense-QC y A3 para la batería).</p>';
  const hl=v=>v?'ALTO':'BAJO';$('sGpio').innerHTML=tbl([['GP6 · Pulse1 / SDI-12 RX',hl(D.p1)],['GP7 · Pulse2 / SDI-12 TX',hl(D.p2)],['GP20 · UART RX',hl(D.urx)]]);
  const so=D.soil;
@@ -248,6 +248,7 @@ function rTst(){const a=D.sa,w=D.wx,d=D.dis,busy=a.st==='test'||w.st==='test'||d
   else h='<p class="st"><span class="dot"></span>Descargando…</p>';
   h+=tbl([['Voltaje',f(d.v,3)+' V'],['Corriente',f(d.i,1)+' mA'],['Carga',f(d.mah,2)+' mAh'],['Energía',f(d.mwh,1)+' mWh'],['Tiempo',hms(d.s)],['Corriente pico',f(d.pk,1)+' mA']])}
  $('tDis').innerHTML=h;$('bDs').disabled=busy||no;$('bDp').disabled=d.st!=='run'}
+async function s10(){if(await post('sht10'))toast('SHT10 leído');pollData()}
 async function test(t){if(await post('test?t='+t))pollData()}
 async function disch(op){if(!confirm(op==='start'?'Conecte la batería y la resistencia de carga. ¿Iniciar la descarga?':'¿Detener la descarga?'))return;if(await post('disch?op='+op))pollData()}
 
