@@ -6,6 +6,19 @@ Convenciones:
 - El encabezado de cada `.ino` indica el MCU para el que está hecho.
 - Nombres de archivo del S3: `esp-s3-v0.2.x`.
 
+## 0.1.6 - ESP32-C3 sin pantalla ni botones (solo web)
+Carpeta `CODE/V0.1.6/tester_esp32_v0_1_6/`, con `tester_esp32_v0_1_6.ino` e `index_html.h` en la misma carpeta.
+- La misma GUI web y la misma red que la 0.2.2 (`LemPDA-XXXX`, clave `12345678`, `http://192.168.4.1`), sin OLED, encoder ni botones.
+- La lógica de medición y de los tests es la de la 0.1.5, con sus arreglos. Los pines son los mismos; GP0, GP1, GP2, GP3 y GP5 quedan libres.
+- En el C3 el bus SDI-12 comparte GP6/GP7 con Pulse1, Pulse2 y el SHT10:
+  - La web no usa el bus mientras corre Sense-QC o Weather-QC.
+  - Sense-QC y Weather-QC no arrancan mientras el bus está en uso.
+  - El SHT10 no se lee mientras el bus está en uso.
+  - Al terminar, los pines vuelven a quedar como entrada.
+- La batería se mide por el ADS1115 (A3). Si falta el ADS1115, la web muestra "Sin dato de batería".
+- La potencia WiFi está en 8,5 dBm, porque muchos C3 SuperMini fallan a potencia máxima.
+- Sin INA228, la web sigue funcionando: muestra el error y el gestor SDI-12 sigue disponible.
+
 ## 0.2.2 - ESP32-S3 LOLIN Mini (portal web)
 Carpeta `CODE/V0.2.2/esp-s3-v0.2.2/`, con `esp-s3-v0.2.2.ino` e `index_html.h` en la misma carpeta.
 - Red WiFi propia `LemPDA-XXXX` (últimos 4 dígitos hex de la MAC), clave `12345678` (`AP_PASS`). WPA2 no acepta claves de menos de 8 caracteres.
